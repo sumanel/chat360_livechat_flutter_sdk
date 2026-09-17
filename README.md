@@ -16,7 +16,7 @@ checkout:
 dependencies:
   chat360_livechat_sdk:
     git:
-      url: https://github.com/<org>/chat360_livechat_sdk.git
+      url: https://github.com/sumanel/chat360_livechat_flutter_sdk.git
   # — or, from a local checkout —
   # chat360_livechat_sdk:
   #   path: ../chat360_livechat_sdk
@@ -61,7 +61,9 @@ await auth.logout();
 ```
 
 See the [example app](example) for a complete runnable version, including
-a login screen.
+a login screen, or [INTEGRATION.md](INTEGRATION.md) for a full step-by-step
+walkthrough (minimum OS/Flutter/Dart support, required host config, and a
+worked email/password login screen).
 
 ## Usage guide
 

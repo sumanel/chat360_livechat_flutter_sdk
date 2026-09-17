@@ -1,15 +1,8 @@
 name: chat360_livechat_sdk
 description: "Chat360LiveChatSDK — embeds the Chat360 business live-chat console (app.chat360.io) as an already-authenticated, mobile-shell view."
 version: 0.0.1
-# TODO: set this to the public repo URL once this is pushed to GitHub (or
-# wherever it ends up) — pub flags its absence as a (non-blocking) warning,
-# but a fabricated URL would be worse than a TODO.
-# repository: https://github.com/<org>/chat360_livechat_sdk
-#
-# This is intended to be open-sourced to the public pub.dev registry.
-# `publish_to: none` stays in place only until that's an intentional,
-# reviewed action — remove this line (there is no private registry to
-# redirect it to) when it's actually time to run `flutter pub publish`.
+repository: https://github.com/sumanel/chat360_livechat_flutter_sdk
+
 publish_to: none
 
 environment:
@@ -20,7 +13,8 @@ dependencies:
   flutter:
     sdk: flutter
   webview_flutter: ^4.9.0
-  webview_flutter_android: ^4.4.2
+
+  webview_flutter_android: '>=3.16.9 <5.0.0'
   file_picker: ^8.0.6
   permission_handler: ^11.3.1
   url_launcher: ^6.1.5

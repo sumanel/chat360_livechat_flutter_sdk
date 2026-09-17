@@ -15,3 +15,7 @@ Initial release.
 - `Chat360LiveChatController` — opens a specific conversation
   programmatically, including routing a push notification tap straight to
   the right conversation.
+- `webview_flutter_android` floor widened from `^4.4.2` to `>=3.16.9 <5.0.0`
+  so the package resolves on Flutter 3.24.x (Dart 3.5.x) — every
+  `webview_flutter_android` release from 4.3.3 onward requires Dart
+  >=3.6.0, which had silently excluded Flutter 3.24.x entirely.
