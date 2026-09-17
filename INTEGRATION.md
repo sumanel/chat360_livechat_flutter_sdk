@@ -6,7 +6,7 @@ with the Chat360 credentials your admin portal issued, as opposed to a host
 that already has tokens from its own SSO (see `Chat360LiveAuth.withTokens` in
 the [README](README.md) for that case).
 
-SDK version: **0.0.1**
+SDK version: **0.0.1** (tagged [`0.0.1`](https://github.com/sumanel/chat360_livechat_flutter_sdk/releases/tag/0.0.1) in the repo)
 
 ---
 
@@ -18,6 +18,7 @@ dependencies:
   chat360_livechat_sdk:
     git:
       url: https://github.com/sumanel/chat360_livechat_flutter_sdk.git
+      ref: "0.0.1" # pin to the tagged release
   # — or, from a local checkout —
   # chat360_livechat_sdk:
   #   path: ../chat360_livechat_sdk
