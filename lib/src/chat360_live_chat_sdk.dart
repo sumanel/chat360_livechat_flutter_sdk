@@ -1,5 +1,6 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:image_picker/image_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -609,7 +610,24 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     await [Permission.microphone, Permission.camera].request();
   }
 
+  /// Handles Android's file-chooser callback for `<input type="file">`.
+  ///
+  /// `file_picker` only ever browses existing files, so a plain page
+  /// `<input type="file">` uses it as-is. But `params.isCaptureEnabled`
+  /// (set when the page adds a `capture` attribute, e.g. for a "take a
+  /// photo" attachment button) means the page wants the camera directly —
+  /// `file_picker` has no camera UI, so that case goes through
+  /// `image_picker`'s `ImageSource.camera` instead.
   Future<List<String>> _onShowFileSelector(FileSelectorParams params) async {
+    if (params.isCaptureEnabled) {
+      final wantsVideo = params.acceptTypes.any((type) => type.startsWith('video/'));
+      final picker = ImagePicker();
+      final file = wantsVideo
+          ? await picker.pickVideo(source: ImageSource.camera)
+          : await picker.pickImage(source: ImageSource.camera);
+      return file == null ? const [] : [Uri.file(file.path).toString()];
+    }
+
     final result = await FilePicker.platform.pickFiles(
       allowMultiple: params.mode == FileSelectorMode.openMultiple,
       type: FileType.any,
