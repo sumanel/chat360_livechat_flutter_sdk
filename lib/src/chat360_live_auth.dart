@@ -26,6 +26,31 @@ class Chat360LiveAuthException implements Exception {
   String toString() => 'Chat360LiveAuthException: $message';
 }
 
+/// An OEM mobile SSO credential to exchange for a Chat360 session via
+/// `POST /api/campaign-oem/sso/login` — see [Chat360LiveAuth.withJWT].
+///
+/// v0 supports only `clientId: "heromotocorp"`. For that client, [extra]
+/// must contain non-blank `loginId`, `dealerCode`, and `divisionName`
+/// entries, matching what the OEM app already holds from Hero's own login.
+@immutable
+class Chat360JWTTokens {
+  const Chat360JWTTokens({
+    required this.clientId,
+    required this.jwtToken,
+    this.extra = const {},
+  });
+
+  /// Must be `"heromotocorp"` in v0 — any other value is rejected server-side.
+  final String clientId;
+
+  /// The OEM's own JWT (e.g. Hero's), forwarded as-is for verification.
+  final String jwtToken;
+
+  /// Client-specific fields required alongside [jwtToken]. For
+  /// `heromotocorp`: `loginId`, `dealerCode`, `divisionName`.
+  final Map<String, String> extra;
+}
+
 /// Owns the whole Chat360 agent session lifecycle: login, logout, silent
 /// token refresh, and FCM registration — so a host app calls [login] and
 /// [logout] at the same moments its own session starts and ends, and never
@@ -92,6 +117,10 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// password to pass to [login]. Refresh, logout, and FCM registration
   /// all work the same as if [login] had produced these tokens.
   ///
+  /// Pass [fcmToken] (obtained from the host's own Firebase setup) to
+  /// register it for push via `mobile/notify` right away, same as [login]'s
+  /// own [fcmToken] parameter.
+  ///
   /// Like the default constructor, this returns the app's single
   /// [Chat360LiveAuth] — if one already exists, [tokens] simply replaces its
   /// current session (persisted right away) rather than creating a second
@@ -100,6 +129,7 @@ class Chat360LiveAuth extends ChangeNotifier {
     Chat360Tokens tokens, {
     String baseUrl = 'https://app.chat360.io',
     String? appId,
+    String? fcmToken,
     http.Client? httpClient,
     FlutterSecureStorage? storage,
   }) {
@@ -110,9 +140,49 @@ class Chat360LiveAuth extends ChangeNotifier {
       storage: storage,
     );
     instance._tokens = tokens;
-    instance._isRestoring = false;
+    instance._isRestoringFromStorage = false;
     unawaited(instance._persist());
     instance.notifyListeners();
+    if (fcmToken != null) {
+      unawaited(instance._registerFcm(fcmToken));
+    }
+    return instance;
+  }
+
+  /// For a host on the OEM mobile SSO path: it has an OEM JWT (e.g. Hero's)
+  /// rather than a Chat360 email/password or an existing token pair, and
+  /// needs [Chat360LiveAuth] to exchange it via
+  /// `POST /api/campaign-oem/sso/login` before a session exists.
+  ///
+  /// Unlike [withTokens], this can't hand back a session synchronously —
+  /// the exchange is a network call. It returns the singleton immediately,
+  /// same as every other factory here, and performs the exchange in the
+  /// background; [tokens] stays null and [isRestoring] stays true until it
+  /// resolves, so callers (and [Chat360LiveChatSDK]) see the same "still
+  /// figuring out the session" state they'd see while a persisted session
+  /// is loading. On failure, [tokens] stays null and [lastSsoError] carries
+  /// the API's `message` (or a network-error fallback) for the host to
+  /// show — matching the API contract's "display message as-is".
+  ///
+  /// Pass [fcmToken] (obtained from the host's own Firebase setup) to
+  /// register it for push via `mobile/notify` once the exchange succeeds,
+  /// same as [login]'s own [fcmToken] parameter.
+  factory Chat360LiveAuth.withJWT(
+    Chat360JWTTokens jwt, {
+    String baseUrl = 'https://app.chat360.io',
+    String? appId,
+    String? fcmToken,
+    http.Client? httpClient,
+    FlutterSecureStorage? storage,
+  }) {
+    final instance = Chat360LiveAuth(
+      baseUrl: baseUrl,
+      appId: appId,
+      httpClient: httpClient,
+      storage: storage,
+    );
+    instance._isExchangingSso = true;
+    unawaited(instance._loginWithOemSso(jwt, fcmToken: fcmToken));
     return instance;
   }
 
@@ -147,14 +217,24 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// The current session, or null if signed out.
   Chat360Tokens? get tokens => _tokens;
 
-  bool _isRestoring = true;
+  bool _isRestoringFromStorage = true;
+  bool _isExchangingSso = false;
 
   /// True until a persisted session (if any) has been loaded from secure
-  /// storage. [Chat360LiveChatSDK] treats this as "still figuring out
-  /// whether there's a session", not as signed out — showing a signed-out
-  /// state before this finishes would flash it even for an agent who was,
-  /// and still is, logged in.
-  bool get isRestoring => _isRestoring;
+  /// storage, and, if [Chat360LiveAuth.withJWT] kicked off an OEM SSO
+  /// exchange, until that resolves too. [Chat360LiveChatSDK] treats this as
+  /// "still figuring out whether there's a session", not as signed out —
+  /// showing a signed-out state before this finishes would flash it even
+  /// for an agent who was, and still is, logged in (or about to be, via
+  /// SSO).
+  bool get isRestoring => _isRestoringFromStorage || _isExchangingSso;
+
+  /// The API's `message` from the most recent failed
+  /// [Chat360LiveAuth.withJWT] exchange, e.g. `"Dealer mapping not found
+  /// for this login."`. Null if there's never been a failed exchange, or a
+  /// later one succeeded. The OEM SSO API contract calls for showing this
+  /// string to the user as-is.
+  String? lastSsoError;
 
   String? _email;
   String? _registeredFcmToken;
@@ -179,15 +259,20 @@ class Chat360LiveAuth extends ChangeNotifier {
     // Since this class is a singleton, the disk reads above can finish
     // after Chat360LiveAuth.withTokens (or an unusually fast login()) has
     // already given this instance a session — don't clobber it with
-    // whatever was (or wasn't) on disk from before.
-    if (_tokens == null) {
+    // whatever was (or wasn't) on disk from before. Chat360LiveAuth.withJWT
+    // sets _tokens only once its network exchange resolves, which is far
+    // slower than this local read — _isExchangingSso covers that gap so a
+    // *previous* on-disk session (a different agent's, say) can't get
+    // loaded and briefly used while the new SSO exchange is still in
+    // flight.
+    if (_tokens == null && !_isExchangingSso) {
       _email = email;
       _registeredFcmToken = fcmToken;
       if (access != null && refresh != null) {
         _tokens = Chat360Tokens(accessToken: access, refreshToken: refresh);
       }
     }
-    _isRestoring = false;
+    _isRestoringFromStorage = false;
     notifyListeners();
   }
 
@@ -256,6 +341,47 @@ class Chat360LiveAuth extends ChangeNotifier {
     return tokens;
   }
 
+  /// Backs [Chat360LiveAuth.withJWT]: exchanges an OEM JWT for a Chat360
+  /// session via `POST /api/campaign-oem/sso/login`. Every failure path in
+  /// that API is a 400 with a `message` string, so — unlike [login], which
+  /// throws — this stores it in [lastSsoError] instead: there's no caller
+  /// left to catch an exception by the time this runs, since [withJWT]
+  /// already returned the singleton before this started.
+  Future<void> _loginWithOemSso(Chat360JWTTokens jwt, {String? fcmToken}) async {
+    try {
+      final response = await _http.post(
+        _api('campaign-oem/sso/login'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'clientId': jwt.clientId,
+          'token': jwt.jwtToken,
+          'extra': jwt.extra,
+        }),
+      );
+      final body = jsonDecode(response.body) as Map<String, dynamic>;
+      if (response.statusCode != 200) {
+        lastSsoError =
+            (body['message'] as String?) ??
+            'OEM SSO login failed (${response.statusCode}).';
+        return;
+      }
+      lastSsoError = null;
+      _tokens = Chat360Tokens(
+        accessToken: body['accessToken'] as String,
+        refreshToken: body['refreshToken'] as String,
+      );
+      await _persist();
+      if (fcmToken != null) {
+        await _registerFcm(fcmToken);
+      }
+    } catch (_) {
+      lastSsoError = 'Token validation failed.';
+    } finally {
+      _isExchangingSso = false;
+      notifyListeners();
+    }
+  }
+
   /// Logs out via `auth/logout`, unregisters the FCM token if one was
   /// registered at [login] — even in a previous run of the app, since that
   /// registration is persisted — and clears the local session regardless
@@ -321,35 +447,45 @@ class Chat360LiveAuth extends ChangeNotifier {
     return refreshed;
   }
 
+  /// Never throws — every caller (`login`, `withTokens`, `withJWT`) treats
+  /// FCM registration as a side effect of a session that's already
+  /// established, not part of what makes login succeed or fail. A flaky
+  /// network on this call shouldn't turn a successful sign-in into a
+  /// reported failure, so any error here is logged and swallowed instead.
   Future<void> _registerFcm(String fcmToken) async {
-    final email = await _resolveEmail();
-    final accessToken = _tokens?.accessToken;
-    if (email == null || accessToken == null) return;
+    try {
+      final email = await _resolveEmail();
+      final accessToken = _tokens?.accessToken;
+      if (email == null || accessToken == null) return;
 
-    final response = await _http.post(
-      _api('mobile/notify'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $accessToken',
-      },
-      body: jsonEncode({
-        'email': email,
-        'fcm_token': fcmToken,
-        'device_type': Platform.isAndroid ? 'android' : 'ios',
-        if (appId != null) 'app_id': appId,
-      }),
-    );
-    if (response.statusCode == 200) {
-      _registeredFcmToken = fcmToken;
-      await _persist();
-    } else {
-      // Best-effort, same as elsewhere — but a non-200 here (e.g. "SDK not
-      // found" from a wrong/deleted appId) is a config bug worth surfacing
-      // during integration rather than failing silently forever.
-      debugPrint(
-        'Chat360LiveAuth: FCM registration failed '
-        '(${response.statusCode}): ${response.body}',
+      final response = await _http.post(
+        _api('mobile/notify'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $accessToken',
+        },
+        body: jsonEncode({
+          'email': email,
+          'fcm_token': fcmToken,
+          'device_type': Platform.isAndroid ? 'android' : 'ios',
+          if (appId != null) 'app_id': appId,
+        }),
       );
+      if (response.statusCode == 200) {
+        _registeredFcmToken = fcmToken;
+        await _persist();
+      } else {
+        // Same best-effort spirit as the catch below — but a non-200 here
+        // (e.g. "SDK not found" from a wrong/deleted appId) is a config bug
+        // worth surfacing during integration rather than failing silently
+        // forever.
+        debugPrint(
+          'Chat360LiveAuth: FCM registration failed '
+          '(${response.statusCode}): ${response.body}',
+        );
+      }
+    } catch (e) {
+      debugPrint('Chat360LiveAuth: FCM registration failed: $e');
     }
   }
 

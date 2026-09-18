@@ -31,10 +31,14 @@ class _DemoAppState extends State<DemoApp> {
   }
 }
 
-/// Logs in with real Chat360 credentials via [Chat360LiveAuth.login] — no
-/// manual token pasting. The demo has no Firebase project wired up, so it
-/// doesn't pass an fcmToken; a real host app would pass the token it gets
-/// from its own Firebase setup here.
+enum _LoginMode { password, heroSso }
+
+/// Logs in either with real Chat360 credentials via [Chat360LiveAuth.login],
+/// or via the Hero mobile OEM SSO exchange
+/// (`POST /api/campaign-oem/sso/login`) via [Chat360LiveAuth.withJWT]. The
+/// demo has no Firebase project wired up, so it doesn't pass an fcmToken; a
+/// real host app would pass the token it gets from its own Firebase setup
+/// to either path.
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key, required this.auth});
 
@@ -45,11 +49,21 @@ class LoginPage extends StatefulWidget {
 }
 
 class _LoginPageState extends State<LoginPage> {
+  _LoginMode _mode = _LoginMode.password;
+
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
   final _baseUrlController = TextEditingController(
     text: 'https://app.chat360.io',
   );
+
+  // Hero mobile SSO — clientId is fixed to "heromotocorp" in v0. These
+  // fields are what the OEM app already holds from Hero's own login.
+  final _jwtController = TextEditingController();
+  final _loginIdController = TextEditingController();
+  final _dealerCodeController = TextEditingController();
+  final _divisionNameController = TextEditingController();
+
   bool _isLoggingIn = false;
   String? _error;
 
@@ -58,6 +72,10 @@ class _LoginPageState extends State<LoginPage> {
     _emailController.dispose();
     _passwordController.dispose();
     _baseUrlController.dispose();
+    _jwtController.dispose();
+    _loginIdController.dispose();
+    _dealerCodeController.dispose();
+    _divisionNameController.dispose();
     super.dispose();
   }
 
@@ -75,19 +93,76 @@ class _LoginPageState extends State<LoginPage> {
     try {
       await widget.auth.login(email: email, password: password);
       if (!mounted) return;
-      Navigator.of(context).push(
-        MaterialPageRoute(
-          builder: (_) => LiveChatPage(
-            auth: widget.auth,
-            baseUrl: _baseUrlController.text.trim(),
-          ),
-        ),
-      );
+      _openLiveChat(widget.auth);
     } on Chat360LiveAuthException catch (e) {
       setState(() => _error = e.message);
     } finally {
       if (mounted) setState(() => _isLoggingIn = false);
     }
+  }
+
+  /// [Chat360LiveAuth.withJWT] can't be awaited directly — the exchange
+  /// happens in the background and the singleton it returns is the same
+  /// [widget.auth] this page already holds. This listens for
+  /// [Chat360LiveAuth.isRestoring] to clear, then checks whether the
+  /// exchange actually produced a session ([Chat360LiveAuth.tokens]) or
+  /// failed ([Chat360LiveAuth.lastSsoError]).
+  Future<void> _loginWithHeroSso() async {
+    final jwtToken = _jwtController.text.trim();
+    final loginId = _loginIdController.text.trim();
+    final dealerCode = _dealerCodeController.text.trim();
+    final divisionName = _divisionNameController.text.trim();
+    if (jwtToken.isEmpty ||
+        loginId.isEmpty ||
+        dealerCode.isEmpty ||
+        divisionName.isEmpty) {
+      setState(() => _error = 'Fill in the Hero JWT and all extra fields.');
+      return;
+    }
+    setState(() {
+      _isLoggingIn = true;
+      _error = null;
+    });
+
+    final auth = Chat360LiveAuth.withJWT(
+      Chat360JWTTokens(
+        clientId: 'heromotocorp',
+        jwtToken: jwtToken,
+        extra: {
+          'loginId': loginId,
+          'dealerCode': dealerCode,
+          'divisionName': divisionName,
+        },
+      ),
+    );
+
+    void onAuthChanged() {
+      if (auth.isRestoring) return;
+      auth.removeListener(onAuthChanged);
+      if (!mounted) return;
+      setState(() => _isLoggingIn = false);
+      if (auth.tokens != null) {
+        _openLiveChat(auth);
+      } else {
+        setState(() => _error = auth.lastSsoError ?? 'Hero SSO login failed.');
+      }
+    }
+
+    auth.addListener(onAuthChanged);
+    // Covers the (unlikely) case where the exchange already finished by
+    // the time the listener above is attached.
+    if (!auth.isRestoring) onAuthChanged();
+  }
+
+  void _openLiveChat(Chat360LiveAuth auth) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => LiveChatPage(
+          auth: auth,
+          baseUrl: _baseUrlController.text.trim(),
+        ),
+      ),
+    );
   }
 
   @override
@@ -100,7 +175,27 @@ class _LoginPageState extends State<LoginPage> {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              const Text('Log in with real Chat360 agent credentials.'),
+              SegmentedButton<_LoginMode>(
+                segments: const [
+                  ButtonSegment(
+                    value: _LoginMode.password,
+                    label: Text('Email & password'),
+                  ),
+                  ButtonSegment(
+                    value: _LoginMode.heroSso,
+                    label: Text('Hero SSO'),
+                  ),
+                ],
+                selected: {_mode},
+                onSelectionChanged: _isLoggingIn
+                    ? null
+                    : (selection) {
+                        setState(() {
+                          _mode = selection.first;
+                          _error = null;
+                        });
+                      },
+              ),
               const SizedBox(height: 20),
               TextField(
                 controller: _baseUrlController,
@@ -110,32 +205,21 @@ class _LoginPageState extends State<LoginPage> {
                 ),
               ),
               const SizedBox(height: 12),
-              TextField(
-                controller: _emailController,
-                decoration: const InputDecoration(
-                  labelText: 'Email',
-                  border: OutlineInputBorder(),
-                ),
-                keyboardType: TextInputType.emailAddress,
-                autocorrect: false,
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: _passwordController,
-                decoration: const InputDecoration(
-                  labelText: 'Password',
-                  border: OutlineInputBorder(),
-                ),
-                obscureText: true,
-                onSubmitted: (_) => _login(),
-              ),
+              if (_mode == _LoginMode.password)
+                ..._passwordFields()
+              else
+                ..._heroSsoFields(),
               if (_error != null) ...[
                 const SizedBox(height: 12),
                 Text(_error!, style: const TextStyle(color: Colors.red)),
               ],
               const SizedBox(height: 20),
               FilledButton(
-                onPressed: _isLoggingIn ? null : _login,
+                onPressed: _isLoggingIn
+                    ? null
+                    : (_mode == _LoginMode.password
+                        ? _login
+                        : _loginWithHeroSso),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   child: _isLoggingIn
@@ -144,7 +228,11 @@ class _LoginPageState extends State<LoginPage> {
                           width: 20,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : const Text('Log in'),
+                      : Text(
+                          _mode == _LoginMode.password
+                              ? 'Log in'
+                              : 'Sign in with Hero SSO',
+                        ),
                 ),
               ),
             ],
@@ -153,6 +241,70 @@ class _LoginPageState extends State<LoginPage> {
       ),
     );
   }
+
+  List<Widget> _passwordFields() => [
+        const Text('Log in with real Chat360 agent credentials.'),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _emailController,
+          decoration: const InputDecoration(
+            labelText: 'Email',
+            border: OutlineInputBorder(),
+          ),
+          keyboardType: TextInputType.emailAddress,
+          autocorrect: false,
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _passwordController,
+          decoration: const InputDecoration(
+            labelText: 'Password',
+            border: OutlineInputBorder(),
+          ),
+          obscureText: true,
+          onSubmitted: (_) => _login(),
+        ),
+      ];
+
+  List<Widget> _heroSsoFields() => [
+        const Text(
+          'Exchanges a Hero mobile JWT for a Chat360 session '
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _jwtController,
+          decoration: const InputDecoration(
+            labelText: 'Hero JWT (token)',
+            border: OutlineInputBorder(),
+          ),
+          minLines: 1,
+          maxLines: 4,
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _loginIdController,
+          decoration: const InputDecoration(
+            labelText: 'extra.loginId — e.g. HOST12169',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _dealerCodeController,
+          decoration: const InputDecoration(
+            labelText: 'extra.dealerCode — e.g. 12169',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        const SizedBox(height: 12),
+        TextField(
+          controller: _divisionNameController,
+          decoration: const InputDecoration(
+            labelText: 'extra.divisionName — e.g. 12169 - Main S/R',
+            border: OutlineInputBorder(),
+          ),
+        ),
+      ];
 }
 
 class LiveChatPage extends StatelessWidget {
