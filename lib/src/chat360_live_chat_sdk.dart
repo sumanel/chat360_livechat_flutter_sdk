@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
 import 'package:image_picker/image_picker.dart';
@@ -34,18 +36,32 @@ enum _Status {
 /// parameter.
 class Chat360LiveChatController {
   _Chat360LiveChatSDKState? _state;
+  String? _pendingConversationId;
 
-  void _attach(_Chat360LiveChatSDKState state) => _state = state;
+  void _attach(_Chat360LiveChatSDKState state) {
+    _state = state;
+    final pendingConversationId = _pendingConversationId;
+    if (pendingConversationId != null) {
+      _pendingConversationId = null;
+      unawaited(state._openConversation(pendingConversationId));
+    }
+  }
 
   void _detach(_Chat360LiveChatSDKState state) {
     if (identical(_state, state)) _state = null;
   }
 
   /// Opens the given conversation directly, the same way tapping a chat
-  /// row in the inbox would. If the WebView hasn't finished signing in
-  /// yet, this is queued and applied automatically once it has.
+  /// row in the inbox would. If the SDK is not attached yet, or the WebView
+  /// hasn't finished signing in, this is queued and applied automatically
+  /// once it can be shown.
   Future<void> openConversation(String roomId) async {
-    await _state?._openConversation(roomId);
+    final state = _state;
+    if (state == null) {
+      _pendingConversationId = roomId;
+      return;
+    }
+    await state._openConversation(roomId);
   }
 
   /// Extracts the room id from a Chat360 push notification's data payload
@@ -127,7 +143,6 @@ class Chat360LiveChatSDK extends StatefulWidget {
   const Chat360LiveChatSDK({
     super.key,
     required this.auth,
-    this.baseUrl = 'https://app.chat360.io',
     this.controller,
     this.loadingBuilder,
     this.signedOutBuilder,
@@ -145,10 +160,6 @@ class Chat360LiveChatSDK extends StatefulWidget {
   /// or [Chat360LiveChatController.handleNotificationTap] to jump straight
   /// to a specific conversation, e.g. from a push notification tap.
   final Chat360LiveChatController? controller;
-
-  /// Overridable for staging (e.g. `https://staging.chat360.io`). Must
-  /// match the `baseUrl` [auth] was constructed with.
-  final String baseUrl;
 
   /// Shown in place of the WebView until it's actually settled on
   /// `/live-chats` with its chrome hidden. Covers the login-page flash and
@@ -200,13 +211,17 @@ class Chat360LiveChatSDK extends StatefulWidget {
   final void Function(WebResourceError error)? onWebResourceError;
 
   @override
-  State<Chat360LiveChatSDK> createState() =>
-      _Chat360LiveChatSDKState();
+  State<Chat360LiveChatSDK> createState() => _Chat360LiveChatSDKState();
 }
 
 class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   static const _liveChatsPath = '/live-chats';
   static final _chatDetailPath = RegExp(r'^/chats/[0-9a-fA-F-]{36}$');
+
+  // Trims a trailing slash so a baseUrl given to auth as e.g.
+  // "https://dev-oem.chat360.io/" doesn't double up with the leading slash
+  // every path built below already has.
+  String get _baseUrl => widget.auth.baseUrl.replaceAll(RegExp(r'/+$'), '');
 
   late final WebViewController _controller;
   _Status _status = _Status.loading;
@@ -304,7 +319,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
       return;
     }
     if (mounted) setState(() => _isOnChatDetail = true);
-    await _controller.loadRequest(Uri.parse('${widget.baseUrl}/chats/$roomId'));
+    await _controller.loadRequest(Uri.parse('${_baseUrl}/chats/$roomId'));
   }
 
   /// Fires on every [Chat360LiveAuth] change — including the moment a
@@ -317,21 +332,20 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   /// agent who's still logged in.
   void _onAuthChanged() {
     if (!_hasStartedLoadingWebView && widget.auth.tokens != null) {
-      _hasStartedLoadingWebView = true;
-      _controller.loadRequest(Uri.parse('${widget.baseUrl}$_liveChatsPath'));
+      unawaited(_beginLoadingWebView());
       return;
     }
     if (widget.auth.tokens == null &&
         !widget.auth.isRestoring &&
-        _status != _Status.signedOut) {
+        _status != _Status.signedOut &&
+        _status != _Status.authError) {
       setState(() => _status = _Status.signedOut);
     }
   }
 
   void _startIfSignedIn() {
     if (widget.auth.tokens != null) {
-      _hasStartedLoadingWebView = true;
-      _controller.loadRequest(Uri.parse('${widget.baseUrl}$_liveChatsPath'));
+      unawaited(_beginLoadingWebView());
       return;
     }
     if (!widget.auth.isRestoring) {
@@ -339,6 +353,35 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     }
     // Otherwise: still restoring a persisted session — stay in
     // _Status.loading and let _onAuthChanged react once that resolves.
+  }
+
+  /// Starts the WebView load for a session that's ready to be shown —
+  /// shared by [_onAuthChanged] and [_startIfSignedIn], both of which call
+  /// this the moment tokens first appear. First proactively refreshes if
+  /// the access token looks expired ([Chat360LiveAuth.ensureFreshTokens]),
+  /// rather than finding out only after the WebView loads a page it then
+  /// has to detect was wrong — [_onPageFinished]'s reactive detection below
+  /// can't see a client-side (SPA) redirect to the console's own login view
+  /// at all, since that doesn't fire a new page-load event, so this is the
+  /// only reliable place to catch an already-dead token.
+  ///
+  /// Sets [_hasStartedLoadingWebView] synchronously (before the first
+  /// `await`) so a second call — including a reentrant one from
+  /// [_onAuthChanged] firing again while [Chat360LiveAuth.ensureFreshTokens]
+  /// is still resolving — can't start a second, overlapping load.
+  Future<void> _beginLoadingWebView() async {
+    _hasStartedLoadingWebView = true;
+    final tokens = await widget.auth.ensureFreshTokens();
+    if (!mounted) return;
+    if (tokens == null) {
+      // Had a session, tried to make it work, couldn't — same "only a real
+      // login recovers this" situation _onPageFinished's own refresh
+      // attempt below lands on, so it gets the same status rather than the
+      // generic signedOut a plain missing session would.
+      setState(() => _status = _Status.authError);
+      return;
+    }
+    await _controller.loadRequest(Uri.parse('$_baseUrl$_liveChatsPath'));
   }
 
   Future<NavigationDecision> _onNavigationRequest(
@@ -381,7 +424,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   }
 
   bool _isAllowedPath(Uri uri) {
-    final baseHost = Uri.parse(widget.baseUrl).host;
+    final baseHost = Uri.parse(_baseUrl).host;
     if (uri.host != baseHost) return false;
     return uri.path == _liveChatsPath || _chatDetailPath.hasMatch(uri.path);
   }
@@ -408,7 +451,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
       // route) sends the app to its own default landing page instead of
       // back to /live-chats. Targeting /live-chats directly sidesteps that
       // regardless of where the race left us.
-      await _controller.loadRequest(Uri.parse('${widget.baseUrl}$_liveChatsPath'));
+      await _controller.loadRequest(Uri.parse('${_baseUrl}$_liveChatsPath'));
       return;
     }
     if (!_hasVerifiedLiveChatsRoute) {
@@ -434,7 +477,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
         }
         _hasInjectedSession = false;
         _hasVerifiedLiveChatsRoute = false;
-        await _controller.loadRequest(Uri.parse('${widget.baseUrl}$_liveChatsPath'));
+        await _controller.loadRequest(Uri.parse('${_baseUrl}$_liveChatsPath'));
         return;
       }
     }
@@ -620,7 +663,8 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   /// `image_picker`'s `ImageSource.camera` instead.
   Future<List<String>> _onShowFileSelector(FileSelectorParams params) async {
     if (params.isCaptureEnabled) {
-      final wantsVideo = params.acceptTypes.any((type) => type.startsWith('video/'));
+      final wantsVideo =
+          params.acceptTypes.any((type) => type.startsWith('video/'));
       final picker = ImagePicker();
       final file = wantsVideo
           ? await picker.pickVideo(source: ImageSource.camera)
@@ -660,7 +704,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   Future<void> _handleBack() async {
     if (_isOnChatDetail) {
       setState(() => _isOnChatDetail = false);
-      await _controller.loadRequest(Uri.parse('${widget.baseUrl}$_liveChatsPath'));
+      await _controller.loadRequest(Uri.parse('${_baseUrl}$_liveChatsPath'));
       return;
     }
     if (widget.onExitRequested != null) {

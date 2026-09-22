@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:chat360_livechat_sdk/chat360_livechat_sdk.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -31,20 +33,12 @@ class DemoApp extends StatefulWidget {
 }
 
 class _DemoAppState extends State<DemoApp> {
-  final _auth = Chat360LiveAuth();
-
-  @override
-  void dispose() {
-    _auth.dispose();
-    super.dispose();
-  }
-
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Chat360LiveChatSDK demo',
       theme: ThemeData(colorSchemeSeed: const Color(0xFF1F4A3F)),
-      home: LoginPage(auth: _auth),
+      home: const LoginPage(),
     );
   }
 }
@@ -64,10 +58,13 @@ const _testHeroDivisionName = '10251 - Main S/R';
 /// (`POST /api/campaign-oem/sso/login`) via [Chat360LiveAuth.withJWT] —
 /// both take the token this page fetches from its own `firebase_messaging`
 /// setup ([_fetchFcmToken]) and register it for push via `mobile/notify`.
+///
+/// [Chat360LiveAuth] is a true singleton. This page creates it at startup so
+/// it can restore an existing session, then calls [Chat360LiveAuth.updateBaseUrl]
+/// with the [_baseUrlController] value immediately before a new login or SSO
+/// exchange.
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key, required this.auth});
-
-  final Chat360LiveAuth auth;
+  const LoginPage({super.key});
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -75,6 +72,7 @@ class LoginPage extends StatefulWidget {
 
 class _LoginPageState extends State<LoginPage> {
   _LoginMode _mode = _LoginMode.password;
+  late final Chat360LiveAuth _auth;
 
   final _emailController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -95,6 +93,26 @@ class _LoginPageState extends State<LoginPage> {
   @override
   void initState() {
     super.initState();
+    _auth = Chat360LiveAuth(
+      baseUrl: _resolvedBaseUrl(),
+      appId: Platform.isAndroid
+          ? 'io.chat360.livechat_webview_demo'
+          : 'io.chat360.livechatWebviewDemo',
+    );
+    _auth.addListener(_onAuthChanged);
+    // Fires specifically when the agent was signed out on Chat360's side
+    // (revoked, deactivated, forced out elsewhere) rather than by this app
+    // calling logout() — e.g. while LiveChatPage is pushed on top showing
+    // the WebView. Its own authErrorBuilder already covers that page, but
+    // the agent should land back here with an explanation rather than be
+    // stuck on a screen the SDK gave up on.
+    _auth.onSessionExpired = () {
+      if (!mounted) return;
+      Navigator.of(context).popUntil((route) => route.isFirst);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('You were signed out of Chat360.')),
+      );
+    };
     // Asks the OS for notification permission up front so the token below
     // is actually deliverable to (iOS requires this before APNs will hand
     // out a token at all; Android 13+ needs it for the notification to
@@ -104,6 +122,8 @@ class _LoginPageState extends State<LoginPage> {
 
   @override
   void dispose() {
+    _auth.removeListener(_onAuthChanged);
+    _auth.onSessionExpired = null;
     _emailController.dispose();
     _passwordController.dispose();
     _baseUrlController.dispose();
@@ -112,6 +132,28 @@ class _LoginPageState extends State<LoginPage> {
     _dealerCodeController.dispose();
     _divisionNameController.dispose();
     super.dispose();
+  }
+
+  void _onAuthChanged() {
+    if (!mounted) return;
+    // Once a persisted session finishes restoring, Chat360LiveAuth.baseUrl
+    // reflects whatever host that session actually belongs to — which can
+    // differ from the field's own default text if the last login here used
+    // a non-default Base URL. Syncing it back keeps the field honest rather
+    // than showing a value that was never actually in effect.
+    if (!_auth.isRestoring) _baseUrlController.text = _auth.baseUrl;
+    setState(() {});
+  }
+
+  /// The [_baseUrlController] text, trimmed and with any trailing slash
+  /// dropped (`https://dev-oem.chat360.io/` would otherwise double up with
+  /// the leading slash [Chat360LiveAuth] adds to every path, e.g.
+  /// `.../api/...` becoming `..//api/...`), falling back to the default
+  /// when left blank.
+  String _resolvedBaseUrl() {
+    final text = _baseUrlController.text.trim();
+    final trimmed = text.replaceAll(RegExp(r'/+$'), '');
+    return trimmed.isEmpty ? 'https://app.chat360.io' : trimmed;
   }
 
   /// The token this device's `firebase_messaging` setup gets from APNs
@@ -140,14 +182,11 @@ class _LoginPageState extends State<LoginPage> {
       _error = null;
     });
     try {
+      _auth.updateBaseUrl(_resolvedBaseUrl());
       final fcmToken = await _fetchFcmToken();
-      await widget.auth.login(
-        email: email,
-        password: password,
-        fcmToken: fcmToken,
-      );
+      await _auth.login(email: email, password: password, fcmToken: fcmToken);
       if (!mounted) return;
-      _openLiveChat(widget.auth);
+      _openLiveChat();
     } on Chat360LiveAuthException catch (e) {
       setState(() => _error = e.message);
     } finally {
@@ -179,6 +218,7 @@ class _LoginPageState extends State<LoginPage> {
     });
 
     final fcmToken = await _fetchFcmToken();
+    _auth.updateBaseUrl(_resolvedBaseUrl());
     final auth = Chat360LiveAuth.withJWT(
       Chat360JWTTokens(
         clientId: 'heromotocorp',
@@ -190,6 +230,9 @@ class _LoginPageState extends State<LoginPage> {
         },
       ),
       fcmToken: fcmToken,
+      appId: Platform.isAndroid
+          ? 'io.chat360.livechat_webview_demo'
+          : 'io.chat360.livechatWebviewDemo',
     );
 
     void onAuthChanged() {
@@ -198,7 +241,7 @@ class _LoginPageState extends State<LoginPage> {
       if (!mounted) return;
       setState(() => _isLoggingIn = false);
       if (auth.tokens != null) {
-        _openLiveChat(auth);
+        _openLiveChat();
       } else {
         setState(() => _error = auth.lastSsoError ?? 'Hero SSO login failed.');
       }
@@ -210,19 +253,44 @@ class _LoginPageState extends State<LoginPage> {
     if (!auth.isRestoring) onAuthChanged();
   }
 
-  void _openLiveChat(Chat360LiveAuth auth) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => LiveChatPage(
-          auth: auth,
-          baseUrl: _baseUrlController.text.trim(),
-        ),
-      ),
-    );
+  void _openLiveChat() {
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => LiveChatPage(auth: _auth)));
+  }
+
+  Future<void> _logout() async {
+    await _auth.logout();
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_auth.isRestoring) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    if (_auth.tokens != null) {
+      return Scaffold(
+        appBar: AppBar(title: const Text('Chat360LiveChatSDK demo')),
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text('Already logged in.', textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: _openLiveChat,
+                  child: const Text('Open chats'),
+                ),
+                OutlinedButton(onPressed: _logout, child: const Text('Logout')),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     return Scaffold(
       appBar: AppBar(title: const Text('Chat360LiveChatSDK demo')),
       body: SafeArea(
@@ -274,8 +342,8 @@ class _LoginPageState extends State<LoginPage> {
                 onPressed: _isLoggingIn
                     ? null
                     : (_mode == _LoginMode.password
-                        ? _login
-                        : _loginWithHeroSso),
+                          ? _login
+                          : _loginWithHeroSso),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 14),
                   child: _isLoggingIn
@@ -299,28 +367,28 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   List<Widget> _passwordFields() => [
-        const Text('Log in with real Chat360 agent credentials.'),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _emailController,
-          decoration: const InputDecoration(
-            labelText: 'Email',
-            border: OutlineInputBorder(),
-          ),
-          keyboardType: TextInputType.emailAddress,
-          autocorrect: false,
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _passwordController,
-          decoration: const InputDecoration(
-            labelText: 'Password',
-            border: OutlineInputBorder(),
-          ),
-          obscureText: true,
-          onSubmitted: (_) => _login(),
-        ),
-      ];
+    const Text('Log in with real Chat360 agent credentials.'),
+    const SizedBox(height: 12),
+    TextField(
+      controller: _emailController,
+      decoration: const InputDecoration(
+        labelText: 'Email',
+        border: OutlineInputBorder(),
+      ),
+      keyboardType: TextInputType.emailAddress,
+      autocorrect: false,
+    ),
+    const SizedBox(height: 12),
+    TextField(
+      controller: _passwordController,
+      decoration: const InputDecoration(
+        labelText: 'Password',
+        border: OutlineInputBorder(),
+      ),
+      obscureText: true,
+      onSubmitted: (_) => _login(),
+    ),
+  ];
 
   /// Fills in the known test account's loginId/dealerCode/divisionName —
   /// everything except the JWT itself, which has to come from Hero's
@@ -332,59 +400,56 @@ class _LoginPageState extends State<LoginPage> {
   }
 
   List<Widget> _heroSsoFields() => [
-        const Text(
-          'Exchanges a Hero mobile JWT for a Chat360 session '
-        ),
-        const SizedBox(height: 12),
-        Align(
-          alignment: Alignment.centerLeft,
-          child: TextButton.icon(
-            onPressed: _fillTestHeroFields,
-            icon: const Icon(Icons.bolt),
-            label: const Text('Fill test user (loginId/dealerCode/division)'),
-          ),
-        ),
-        TextField(
-          controller: _jwtController,
-          decoration: const InputDecoration(
-            labelText: 'Hero JWT (token)',
-            border: OutlineInputBorder(),
-          ),
-          minLines: 1,
-          maxLines: 4,
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _loginIdController,
-          decoration: const InputDecoration(
-            labelText: 'extra.loginId — e.g. HOST12169',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _dealerCodeController,
-          decoration: const InputDecoration(
-            labelText: 'extra.dealerCode — e.g. 12169',
-            border: OutlineInputBorder(),
-          ),
-        ),
-        const SizedBox(height: 12),
-        TextField(
-          controller: _divisionNameController,
-          decoration: const InputDecoration(
-            labelText: 'extra.divisionName — e.g. 12169 - Main S/R',
-            border: OutlineInputBorder(),
-          ),
-        ),
-      ];
+    const Text('Exchanges a Hero mobile JWT for a Chat360 session '),
+    const SizedBox(height: 12),
+    Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        onPressed: _fillTestHeroFields,
+        icon: const Icon(Icons.bolt),
+        label: const Text('Fill test user (loginId/dealerCode/division)'),
+      ),
+    ),
+    TextField(
+      controller: _jwtController,
+      decoration: const InputDecoration(
+        labelText: 'Hero JWT (token)',
+        border: OutlineInputBorder(),
+      ),
+      minLines: 1,
+      maxLines: 4,
+    ),
+    const SizedBox(height: 12),
+    TextField(
+      controller: _loginIdController,
+      decoration: const InputDecoration(
+        labelText: 'extra.loginId — e.g. HOST12169',
+        border: OutlineInputBorder(),
+      ),
+    ),
+    const SizedBox(height: 12),
+    TextField(
+      controller: _dealerCodeController,
+      decoration: const InputDecoration(
+        labelText: 'extra.dealerCode — e.g. 12169',
+        border: OutlineInputBorder(),
+      ),
+    ),
+    const SizedBox(height: 12),
+    TextField(
+      controller: _divisionNameController,
+      decoration: const InputDecoration(
+        labelText: 'extra.divisionName — e.g. 12169 - Main S/R',
+        border: OutlineInputBorder(),
+      ),
+    ),
+  ];
 }
 
 class LiveChatPage extends StatefulWidget {
-  const LiveChatPage({super.key, required this.auth, required this.baseUrl});
+  const LiveChatPage({super.key, required this.auth});
 
   final Chat360LiveAuth auth;
-  final String baseUrl;
 
   @override
   State<LiveChatPage> createState() => _LiveChatPageState();
@@ -410,11 +475,6 @@ class _LiveChatPageState extends State<LiveChatPage> {
     FirebaseMessaging.onMessageOpenedApp.listen((message) {
       _controller.handleNotificationTap(message.data);
     });
-  }
-
-  Future<void> _logout(BuildContext context) async {
-    await widget.auth.logout();
-    if (context.mounted) Navigator.of(context).pop();
   }
 
   /// Stands in for a tapped push notification, for testing without having
@@ -459,25 +519,21 @@ class _LiveChatPageState extends State<LiveChatPage> {
     return Scaffold(
       body: Chat360LiveChatSDK(
         auth: widget.auth,
-        baseUrl: widget.baseUrl.isEmpty
-            ? 'https://app.chat360.io'
-            : widget.baseUrl,
         controller: _controller,
-        signedOutBuilder: (context) => const Center(
-          child: Text('Signed out.'),
-        ),
-        authErrorBuilder: (context) => const Center(
-          child: Text('Session expired — log in again.'),
-        ),
+        signedOutBuilder: (context) => const Center(child: Text('Signed out.')),
+        authErrorBuilder: (context) =>
+            const Center(child: Text('Session expired — log in again.')),
         // Back from the inbox pops this page (the default), same as
         // tapping the header's own back icon would.
         headerBuilder: (context, {required isOnChatDetail, required onBack}) =>
             Chat360LiveChatHeader(
-          isOnChatDetail: isOnChatDetail,
-          onBack: onBack,
-        ),
+              isOnChatDetail: isOnChatDetail,
+              onBack: onBack,
+            ),
         onWebResourceError: (error) {
-          debugPrint('WebView error: ${error.description} (${error.errorCode})');
+          debugPrint(
+            'WebView error: ${error.description} (${error.errorCode})',
+          );
         },
       ),
       floatingActionButton: FloatingActionButton.extended(
@@ -486,11 +542,6 @@ class _LiveChatPageState extends State<LiveChatPage> {
         icon: const Icon(Icons.notifications_active),
         label: const Text('Simulate push tap'),
       ),
-      // floatingActionButton: FloatingActionButton.small(
-      //   onPressed: () => _logout(context),
-      //   tooltip: 'Log out',
-      //   child: const Icon(Icons.logout),
-      // ),
     );
   }
 }
