@@ -1,7 +1,25 @@
 import 'package:chat360_livechat_sdk/chat360_livechat_sdk.dart';
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter/material.dart';
 
-void main() {
+/// Runs for a data-only/background push while the app isn't in the
+/// foreground. Must be a top-level (or static) function — the platform
+/// calls it in its own isolate. This demo has nothing to do with the
+/// payload here (a tap is what routes to a conversation, handled by
+/// [Chat360LiveChatController.handleNotificationTap] via
+/// [FirebaseMessaging.onMessageOpenedApp]/`getInitialMessage` instead), but
+/// a host that wants to react to a *silent* push (e.g. to update a badge)
+/// would do that here.
+@pragma('vm:entry-point')
+Future<void> _firebaseBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp();
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp();
+  FirebaseMessaging.onBackgroundMessage(_firebaseBackgroundHandler);
   runApp(const DemoApp());
 }
 
@@ -33,12 +51,19 @@ class _DemoAppState extends State<DemoApp> {
 
 enum _LoginMode { password, heroSso }
 
+// A known Hero test account's SSO extra fields, for the "Fill test user"
+// button below — saves retyping them on every test run. The JWT itself
+// isn't here: it's short-lived and comes from Hero's own backend, so it
+// has to be pasted in fresh each time rather than hardcoded.
+const _testHeroLoginId = 'HARSHIT10251';
+const _testHeroDealerCode = '10251';
+const _testHeroDivisionName = '10251 - Main S/R';
+
 /// Logs in either with real Chat360 credentials via [Chat360LiveAuth.login],
 /// or via the Hero mobile OEM SSO exchange
-/// (`POST /api/campaign-oem/sso/login`) via [Chat360LiveAuth.withJWT]. The
-/// demo has no Firebase project wired up, so it doesn't pass an fcmToken; a
-/// real host app would pass the token it gets from its own Firebase setup
-/// to either path.
+/// (`POST /api/campaign-oem/sso/login`) via [Chat360LiveAuth.withJWT] —
+/// both take the token this page fetches from its own `firebase_messaging`
+/// setup ([_fetchFcmToken]) and register it for push via `mobile/notify`.
 class LoginPage extends StatefulWidget {
   const LoginPage({super.key, required this.auth});
 
@@ -68,6 +93,16 @@ class _LoginPageState extends State<LoginPage> {
   String? _error;
 
   @override
+  void initState() {
+    super.initState();
+    // Asks the OS for notification permission up front so the token below
+    // is actually deliverable to (iOS requires this before APNs will hand
+    // out a token at all; Android 13+ needs it for the notification to
+    // show, though FCM delivery itself doesn't depend on it there).
+    FirebaseMessaging.instance.requestPermission();
+  }
+
+  @override
   void dispose() {
     _emailController.dispose();
     _passwordController.dispose();
@@ -77,6 +112,20 @@ class _LoginPageState extends State<LoginPage> {
     _dealerCodeController.dispose();
     _divisionNameController.dispose();
     super.dispose();
+  }
+
+  /// The token this device's `firebase_messaging` setup gets from APNs
+  /// (iOS) / FCM (Android). Best-effort — a device without a valid
+  /// provisioning profile / entitlement, or one that denied notification
+  /// permission, won't have one, and login should proceed without push
+  /// registration rather than fail because of it.
+  Future<String?> _fetchFcmToken() async {
+    try {
+      return await FirebaseMessaging.instance.getToken();
+    } catch (e) {
+      debugPrint('Could not fetch FCM token: $e');
+      return null;
+    }
   }
 
   Future<void> _login() async {
@@ -91,7 +140,12 @@ class _LoginPageState extends State<LoginPage> {
       _error = null;
     });
     try {
-      await widget.auth.login(email: email, password: password);
+      final fcmToken = await _fetchFcmToken();
+      await widget.auth.login(
+        email: email,
+        password: password,
+        fcmToken: fcmToken,
+      );
       if (!mounted) return;
       _openLiveChat(widget.auth);
     } on Chat360LiveAuthException catch (e) {
@@ -124,6 +178,7 @@ class _LoginPageState extends State<LoginPage> {
       _error = null;
     });
 
+    final fcmToken = await _fetchFcmToken();
     final auth = Chat360LiveAuth.withJWT(
       Chat360JWTTokens(
         clientId: 'heromotocorp',
@@ -134,6 +189,7 @@ class _LoginPageState extends State<LoginPage> {
           'divisionName': divisionName,
         },
       ),
+      fcmToken: fcmToken,
     );
 
     void onAuthChanged() {
@@ -266,11 +322,28 @@ class _LoginPageState extends State<LoginPage> {
         ),
       ];
 
+  /// Fills in the known test account's loginId/dealerCode/divisionName —
+  /// everything except the JWT itself, which has to come from Hero's
+  /// backend fresh each time (see [_testHeroLoginId] and friends).
+  void _fillTestHeroFields() {
+    _loginIdController.text = _testHeroLoginId;
+    _dealerCodeController.text = _testHeroDealerCode;
+    _divisionNameController.text = _testHeroDivisionName;
+  }
+
   List<Widget> _heroSsoFields() => [
         const Text(
           'Exchanges a Hero mobile JWT for a Chat360 session '
         ),
         const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerLeft,
+          child: TextButton.icon(
+            onPressed: _fillTestHeroFields,
+            icon: const Icon(Icons.bolt),
+            label: const Text('Fill test user (loginId/dealerCode/division)'),
+          ),
+        ),
         TextField(
           controller: _jwtController,
           decoration: const InputDecoration(
@@ -307,23 +380,89 @@ class _LoginPageState extends State<LoginPage> {
       ];
 }
 
-class LiveChatPage extends StatelessWidget {
+class LiveChatPage extends StatefulWidget {
   const LiveChatPage({super.key, required this.auth, required this.baseUrl});
 
   final Chat360LiveAuth auth;
   final String baseUrl;
 
+  @override
+  State<LiveChatPage> createState() => _LiveChatPageState();
+}
+
+class _LiveChatPageState extends State<LiveChatPage> {
+  // Drives Chat360LiveChatSDK from outside — attached to both the real
+  // FirebaseMessaging listeners below and the "Simulate push tap" button,
+  // so a tap routes to the right conversation the same way regardless of
+  // whether it came from an actual push or the manual test affordance.
+  final _controller = Chat360LiveChatController();
+
+  @override
+  void initState() {
+    super.initState();
+    // Cold start: the app was launched *by* tapping a notification, so
+    // there's no onMessageOpenedApp event to catch — the tapped message is
+    // handed back here instead.
+    FirebaseMessaging.instance.getInitialMessage().then((message) {
+      if (message != null) _controller.handleNotificationTap(message.data);
+    });
+    // Warm start: the app was already running in the background.
+    FirebaseMessaging.onMessageOpenedApp.listen((message) {
+      _controller.handleNotificationTap(message.data);
+    });
+  }
+
   Future<void> _logout(BuildContext context) async {
-    await auth.logout();
+    await widget.auth.logout();
     if (context.mounted) Navigator.of(context).pop();
+  }
+
+  /// Stands in for a tapped push notification, for testing without having
+  /// to actually send one through a Chat360 conversation. Prompts for a
+  /// room id and feeds it through the exact same controller call the
+  /// FirebaseMessaging listeners above make for a real tap.
+  Future<void> _simulatePushTap(BuildContext context) async {
+    final roomIdController = TextEditingController();
+    final roomId = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Simulate push notification tap'),
+        content: TextField(
+          controller: roomIdController,
+          decoration: const InputDecoration(
+            labelText: 'Room_Id',
+            border: OutlineInputBorder(),
+          ),
+          autofocus: true,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () =>
+                Navigator.of(context).pop(roomIdController.text.trim()),
+            child: const Text('Open'),
+          ),
+        ],
+      ),
+    );
+    roomIdController.dispose();
+    if (roomId == null || roomId.isEmpty) return;
+    // Same shape FCM delivers a Chat360 notification's data payload in.
+    await _controller.handleNotificationTap({'Room_Id': roomId});
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       body: Chat360LiveChatSDK(
-        auth: auth,
-        baseUrl: baseUrl.isEmpty ? 'https://app.chat360.io' : baseUrl,
+        auth: widget.auth,
+        baseUrl: widget.baseUrl.isEmpty
+            ? 'https://app.chat360.io'
+            : widget.baseUrl,
+        controller: _controller,
         signedOutBuilder: (context) => const Center(
           child: Text('Signed out.'),
         ),
@@ -340,6 +479,12 @@ class LiveChatPage extends StatelessWidget {
         onWebResourceError: (error) {
           debugPrint('WebView error: ${error.description} (${error.errorCode})');
         },
+      ),
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: () => _simulatePushTap(context),
+        tooltip: 'Simulate a push notification tap',
+        icon: const Icon(Icons.notifications_active),
+        label: const Text('Simulate push tap'),
       ),
       // floatingActionButton: FloatingActionButton.small(
       //   onPressed: () => _logout(context),

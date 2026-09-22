@@ -49,5 +49,11 @@
 	<string>Used for voice input in live chat conversations.</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Used to attach photos in live chat conversations.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+	</array>
+	<key>FirebaseAppDelegateProxyEnabled</key>
+	<true/>
 </dict>
 </plist>

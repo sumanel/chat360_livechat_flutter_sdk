@@ -67,6 +67,16 @@ class Chat360JWTTokens {
 /// calls ignore theirs and just return the existing instance. Call
 /// [Chat360LiveAuth.reset] (test-only) to force a fresh instance.
 ///
+/// A host is expected to call [logout] before a different agent signs in
+/// on the same device, but [login], [withJWT], and [withTokens] don't
+/// depend on that happening: each one best-effort ends whatever session is
+/// currently active — invalidating its refresh token and unregistering its
+/// FCM token — before adopting the new one. Without that, an agent who
+/// never tapped "log out" (app killed, device handed to a teammate) would
+/// leave their refresh token live and their FCM registration in place, so
+/// this device could keep receiving push notifications meant for them even
+/// after someone else signs in.
+///
 /// The session (tokens, email, and which FCM token is currently
 /// registered) is persisted to [FlutterSecureStorage] and restored when
 /// the singleton is first created, so an agent stays signed in across app
@@ -139,10 +149,24 @@ class Chat360LiveAuth extends ChangeNotifier {
       httpClient: httpClient,
       storage: storage,
     );
+    final previousTokens = instance._tokens;
+    final previousEmail = instance._email;
+    final previousFcm = instance._registeredFcmToken;
+
     instance._tokens = tokens;
+    instance._registeredFcmToken = null;
     instance._isRestoringFromStorage = false;
     unawaited(instance._persist());
     instance.notifyListeners();
+    if (previousTokens != null) {
+      unawaited(
+        instance._endSession(
+          previousTokens,
+          email: previousEmail,
+          fcmToken: previousFcm,
+        ),
+      );
+    }
     if (fcmToken != null) {
       unawaited(instance._registerFcm(fcmToken));
     }
@@ -330,11 +354,24 @@ class Chat360LiveAuth extends ChangeNotifier {
       accessToken: body['access'] as String,
       refreshToken: body['refresh'] as String,
     );
+
+    final previousTokens = _tokens;
+    final previousEmail = _email;
+    final previousFcm = _registeredFcmToken;
+
     _tokens = tokens;
     _email = (body['user_email'] as String?) ?? email;
+    _registeredFcmToken = null;
     await _persist();
     notifyListeners();
 
+    if (previousTokens != null) {
+      await _endSession(
+        previousTokens,
+        email: previousEmail,
+        fcmToken: previousFcm,
+      );
+    }
     if (fcmToken != null) {
       await _registerFcm(fcmToken);
     }
@@ -366,11 +403,25 @@ class Chat360LiveAuth extends ChangeNotifier {
         return;
       }
       lastSsoError = null;
+
+      final previousTokens = _tokens;
+      final previousEmail = _email;
+      final previousFcm = _registeredFcmToken;
+
       _tokens = Chat360Tokens(
         accessToken: body['accessToken'] as String,
         refreshToken: body['refreshToken'] as String,
       );
+      _registeredFcmToken = null;
       await _persist();
+
+      if (previousTokens != null) {
+        await _endSession(
+          previousTokens,
+          email: previousEmail,
+          fcmToken: previousFcm,
+        );
+      }
       if (fcmToken != null) {
         await _registerFcm(fcmToken);
       }
@@ -391,24 +442,46 @@ class Chat360LiveAuth extends ChangeNotifier {
     final current = _tokens;
     if (current == null) return;
 
-    if (_registeredFcmToken != null) {
-      await _unregisterFcm(_registeredFcmToken!);
-    }
-    try {
-      await _http.get(
-        _api('auth/logout').replace(
-          queryParameters: {'refresh_token': current.refreshToken},
-        ),
-      );
-    } catch (_) {
-      // Best-effort — proceed to clear the local session regardless.
-    }
+    await _endSession(current, email: _email, fcmToken: _registeredFcmToken);
 
     _tokens = null;
     _email = null;
     _registeredFcmToken = null;
     await _persist();
     notifyListeners();
+  }
+
+  /// Best-effort server-side teardown of a session that's about to stop
+  /// being *the* session — either because [logout] was called, or because
+  /// [login]/[withJWT]/[withTokens] is replacing it with a different one.
+  /// Unregisters [fcmToken] (if any) and invalidates [tokens]' refresh
+  /// token via `auth/logout`. Takes everything as explicit parameters
+  /// rather than reading [_tokens]/[_email]/[_registeredFcmToken] so it's
+  /// safe to call after those fields have already been overwritten with a
+  /// new session's values — as [login] etc. do, so a failed new-session
+  /// network call never leaves the old session torn down for nothing.
+  Future<void> _endSession(
+    Chat360Tokens tokens, {
+    required String? email,
+    required String? fcmToken,
+  }) async {
+    if (fcmToken != null && email != null) {
+      await _unregisterFcmFor(
+        email: email,
+        accessToken: tokens.accessToken,
+        fcmToken: fcmToken,
+      );
+    }
+    try {
+      await _http.get(
+        _api('auth/logout').replace(
+          queryParameters: {'refresh_token': tokens.refreshToken},
+        ),
+      );
+    } catch (_) {
+      // Best-effort — the new session (or the local logout) proceeds
+      // regardless.
+    }
   }
 
   /// Silently refreshes the access token via `auth/token/refresh/`.
@@ -489,24 +562,31 @@ class Chat360LiveAuth extends ChangeNotifier {
     }
   }
 
-  Future<void> _unregisterFcm(String fcmToken) async {
-    final email = _email ?? await _resolveEmail();
-    final accessToken = _tokens?.accessToken;
-    if (email == null || accessToken == null) return;
-
-    await _http.delete(
-      _api('mobile/notify'),
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer $accessToken',
-      },
-      body: jsonEncode({
-        'email': email,
-        'fcm_token': fcmToken,
-        'device_type': Platform.isAndroid ? 'android' : 'ios',
-        if (appId != null) 'app_id': appId,
-      }),
-    );
+  /// Never throws, same best-effort spirit as [_registerFcm] — called from
+  /// [logout]/[_endSession], which both need to keep clearing the local
+  /// session regardless of whether this network call succeeds.
+  Future<void> _unregisterFcmFor({
+    required String email,
+    required String accessToken,
+    required String fcmToken,
+  }) async {
+    try {
+      await _http.delete(
+        _api('mobile/notify'),
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer $accessToken',
+        },
+        body: jsonEncode({
+          'email': email,
+          'fcm_token': fcmToken,
+          'device_type': Platform.isAndroid ? 'android' : 'ios',
+          if (appId != null) 'app_id': appId,
+        }),
+      );
+    } catch (e) {
+      debugPrint('Chat360LiveAuth: FCM unregistration failed: $e');
+    }
   }
 
   Future<String?> _resolveEmail() async {

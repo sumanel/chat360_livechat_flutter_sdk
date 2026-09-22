@@ -3,6 +3,9 @@ plugins {
     id("kotlin-android")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+    // Reads android/app/google-services.json and wires up the Firebase config
+    // firebase_core picks up at runtime.
+    id("com.google.gms.google-services")
 }
 
 android {
@@ -27,7 +30,8 @@ android {
         applicationId = "io.chat360.livechat_webview_demo"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // firebase_messaging requires 23+ (flutter.minSdkVersion defaults to 21).
+        minSdk = maxOf(flutter.minSdkVersion, 23)
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

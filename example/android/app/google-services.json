@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "110584523636",
+    "project_id": "chat360-demo-59893",
+    "storage_bucket": "chat360-demo-59893.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:110584523636:android:a066f41b12a3376167da21",
+        "android_client_info": {
+          "package_name": "io.chat360.livechat_webview_demo"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCqxkirtrw9A_u0S9eyvGHCcIQJMkkWsQM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
