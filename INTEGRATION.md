@@ -175,6 +175,36 @@ try {
   directly for your own navigation logic — the widget in step 6 already
   handles this).
 
+### Alternative: Hero mobile OEM SSO login (`withJWT`)
+
+If your host already has an OEM JWT (e.g. Hero's) instead of a Chat360
+email/password, use `withJWT` in place of `login()` — it exchanges the
+JWT via `POST /api/campaign-oem/sso/login` in the background instead of
+taking credentials directly:
+
+```dart
+final auth = Chat360LiveAuth.withJWT(
+  Chat360JWTTokens(
+    clientId: 'heromotocorp', // the only clientId v0 supports
+    jwtToken: heroJwt,
+    extra: {
+      'loginId': loginId,
+      'dealerCode': dealerCode,
+      'divisionName': divisionName,
+    },
+  ),
+  appId: 'com.partner.app', // same as the default constructor's
+  fcmToken: myFcmToken, // optional — from your own Firebase setup
+);
+```
+
+This is `Chat360LiveAuth`'s *other* factory (in place of, not alongside,
+`Chat360LiveAuth(...)` from step 4) — call it once, the same way you'd
+call `Chat360LiveAuth()`. `auth.tokens` stays null and `auth.isRestoring`
+stays true until the exchange resolves, same as a persisted session still
+loading. On failure, `auth.lastSsoError` carries the API's message (e.g.
+`"Dealer mapping not found for this login."`) to show as-is.
+
 ---
 
 ## 6. Show the widget

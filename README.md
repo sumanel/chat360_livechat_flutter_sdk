@@ -89,6 +89,7 @@ than a Chat360 email/password, wrap them instead:
 ```dart
 Chat360LiveAuth.withTokens(
   Chat360Tokens(accessToken: ..., refreshToken: ...),
+  appId: 'com.partner.app', // same as the default constructor's
 )
 ```
 
@@ -108,6 +109,7 @@ final auth = Chat360LiveAuth.withJWT(
       'divisionName': divisionName,
     },
   ),
+  appId: 'com.partner.app', // same as the default constructor's
   fcmToken: myFcmToken, // optional
 );
 ```
