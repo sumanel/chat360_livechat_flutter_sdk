@@ -8,6 +8,11 @@ the [README](README.md) for that case).
 
 SDK version: **0.0.1** (tagged [`0.0.1`](https://github.com/sumanel/chat360_livechat_flutter_sdk/releases/tag/0.0.1) in the repo)
 
+> Steps 8–10 (remote sign-out, multiple environments, push notifications)
+> describe behavior added since the `0.0.1` tag — see
+> [CHANGELOG.md](CHANGELOG.md#unreleased). If you pinned `ref: "0.0.1"` in
+> your `pubspec.yaml`, point at a later commit (or `main`) to get them.
+
 ---
 
 ## 1. Add the dependency
@@ -210,7 +215,87 @@ network calls succeed.
 
 ---
 
-## 8. Required platform permissions (voice, camera, file uploads)
+## 8. Handle a remote sign-out
+
+`auth.tokens` going null tells you *that* the session ended, not *why* —
+you already know when it's because you called `logout()` yourself, but an
+agent getting signed out on Chat360's own side (admin force-logout,
+session revoked or superseded elsewhere) needs you to actively react,
+often outside whatever screen shows the widget:
+
+```dart
+auth.onSessionExpired = () {
+  navigatorKey.currentState?.popUntil((route) => route.isFirst);
+  showSnackBar('You were signed out of Chat360.');
+};
+```
+
+Fires only for that case — never from your own `logout()`,
+`updateBaseUrl`, or a new `login`/`withJWT`/`withTokens` call replacing
+the session (all things you initiated yourself).
+
+---
+
+## 9. Multiple environments (staging / production)
+
+A session belongs to exactly the `baseUrl` it was created under — that's
+persisted and restored with it automatically, even if a later run
+constructs `Chat360LiveAuth` with a different default. To point an
+already-constructed singleton at a different origin at runtime (e.g. a
+staging URL read from your own settings screen), call `updateBaseUrl`
+rather than trying to reconstruct `Chat360LiveAuth`:
+
+```dart
+auth.updateBaseUrl('https://staging.chat360.io');
+```
+
+If a different origin's session is currently active, this best-effort
+ends it first — a no-op if the origin given is already in effect.
+
+---
+
+## 10. Push notifications
+
+This SDK never touches Firebase — `login()`/`withTokens()`/`withJWT()`
+just take an `fcmToken` string to register via `mobile/notify`. You own
+getting that token and wiring delivery:
+
+1. **Android** — apply the `com.google.gms.google-services` Gradle plugin,
+   add your project's `google-services.json` to `android/app/`, and set
+   `minSdk` to at least 23.
+2. **iOS** — add `GoogleService-Info.plist` to the Xcode project's "Copy
+   Bundle Resources" build phase (not just the filesystem), call
+   `FirebaseApp.configure()` in `AppDelegate.swift` before
+   `GeneratedPluginRegistrant.register`, enable the Push Notifications and
+   Background Modes (remote notification) capabilities (needs a
+   `Runner.entitlements` with `aps-environment`, wired via
+   `CODE_SIGN_ENTITLEMENTS`), and raise `IPHONEOS_DEPLOYMENT_TARGET` to at
+   least 15.0.
+3. Fetch the token after requesting notification permission and pass it
+   as `fcmToken` to `login()`/`withJWT()`/`withTokens()`.
+4. Wire delivery to a conversation via `Chat360LiveChatController`:
+   ```dart
+   final chatController = Chat360LiveChatController();
+   Chat360LiveChatSDK(auth: auth, controller: chatController)
+
+   FirebaseMessaging.onMessageOpenedApp.listen((message) {
+     chatController.handleNotificationTap(message.data);
+   });
+   FirebaseMessaging.instance.getInitialMessage().then((message) {
+     if (message != null) chatController.handleNotificationTap(message.data);
+   });
+   ```
+   `handleNotificationTap` reads the payload's `Room_Id` and no-ops if
+   it's absent, so it's safe to call on every tap.
+
+All of the above is implemented and verified (real device build, real
+APNs sandbox, real login against a live environment) in the
+[example app](example/lib/main.dart) — copy its `android/`/`ios/` config
+and `main.dart` wiring rather than starting from scratch.
+
+---
+
+## 11. Required platform permissions (voice, camera, file uploads)
 
 The SDK can't add these to your app on its own — declare them yourself:
 
@@ -236,7 +321,7 @@ fails on Android with no visible error.
 
 ---
 
-## 9. Full worked example
+## 12. Full worked example
 
 ```dart
 import 'package:flutter/material.dart';
@@ -325,13 +410,17 @@ See the [example app](example) for a complete runnable version.
 
 ---
 
-## 10. Reference
+## 13. Reference
 
-- Full README (session persistence, notification deep-linking, session
+- Full README (session persistence, remote sign-out, multiple
+  environments, push notifications, notification deep-linking, session
   states, known limitations): [README.md](README.md)
 - Auth implementation: [`lib/src/chat360_live_auth.dart`](lib/src/chat360_live_auth.dart)
 - Widget implementation: [`lib/src/chat360_live_chat_sdk.dart`](lib/src/chat360_live_chat_sdk.dart)
+- Unit tests (a working reference for every documented behavior above —
+  login/logout/refresh, session-switching, baseUrl persistence/mismatch,
+  `onSessionExpired`): [`test/chat360_live_auth_test.dart`](test/chat360_live_auth_test.dart)
 
-## 11. Contact
+## 14. Contact
 
 For `appId` and production base URL, contact the Chat360 integration team.

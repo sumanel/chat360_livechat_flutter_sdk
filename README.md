@@ -92,6 +92,75 @@ Chat360LiveAuth.withTokens(
 )
 ```
 
+For the Hero mobile OEM SSO path specifically — an OEM JWT (e.g. Hero's)
+instead of either a Chat360 email/password or an existing token pair —
+use `withJWT`, which exchanges it via `POST /api/campaign-oem/sso/login`
+in the background:
+
+```dart
+final auth = Chat360LiveAuth.withJWT(
+  Chat360JWTTokens(
+    clientId: 'heromotocorp', // the only clientId v0 supports
+    jwtToken: heroJwt,
+    extra: {
+      'loginId': loginId,
+      'dealerCode': dealerCode,
+      'divisionName': divisionName,
+    },
+  ),
+  fcmToken: myFcmToken, // optional
+);
+```
+
+`auth.tokens` stays null and `auth.isRestoring` stays true until the
+exchange resolves — same "still figuring out the session" state a
+restoring persisted session shows. On failure, `auth.lastSsoError` carries
+the API's message (e.g. `"Dealer mapping not found for this login."`) to
+show as-is.
+
+### Handling a remote sign-out
+
+`Chat360LiveAuth.tokens` going null tells a host *that* the session ended,
+but not *why* — that matters because a host calling `logout()` itself
+already knows, but an agent getting signed out on Chat360's own side
+(an admin force-logout, a session revoked or superseded elsewhere) is
+something the host needs to actively react to, often outside whatever
+screen `Chat360LiveChatSDK` happens to be showing at the time:
+
+```dart
+auth.onSessionExpired = () {
+  // e.g. pop back to the host's own login screen and show a message.
+  navigatorKey.currentState?.popUntil((route) => route.isFirst);
+  showSnackBar('You were signed out of Chat360.');
+};
+```
+
+This fires specifically when the server rejects the refresh token — never
+from the host's own `logout()` call, from `updateBaseUrl` switching a
+session to a different origin, or from a `login()`/`withJWT`/`withTokens`
+call replacing the session with a new one (all host-initiated; the host
+already knows why in those cases).
+
+### Multiple environments (staging / production)
+
+A session belongs to exactly the `baseUrl` it was established under —
+`Chat360LiveAuth` persists that alongside the tokens, and a later restore
+recovers it automatically even if the host happens to construct with a
+different default that run. To point an *already-constructed* singleton
+at a different origin (e.g. a host reading a staging URL from its own
+settings screen), use `updateBaseUrl` rather than trying to reconstruct
+`Chat360LiveAuth`:
+
+```dart
+auth.updateBaseUrl('https://staging.chat360.io');
+```
+
+If a different origin's session is currently active, this best-effort
+ends it (against the origin it actually belongs to) before adopting the
+new one — continuing to use it against a different backend would silently
+fail every call. Calling this with the origin already in effect is a
+no-op.
+
 ### Session persistence across app restarts
 
 The session (tokens, email, and which FCM token is currently registered)
@@ -168,9 +237,13 @@ it, voice recording fails on Android with no visible error at all.
 - **`signedOutBuilder`** — `Chat360LiveAuth.tokens` is null, either from
   the start or because the host called `logout()` while this widget was
   showing. The WebView never loads in this state.
-- **`authErrorBuilder`** — a session existed but a `refresh()` couldn't
-  recover it (the refresh token itself was rejected). Only a real
-  `login()` fixes this; there's no automatic retry loop.
+- **`authErrorBuilder`** — a session existed but couldn't be verified to
+  work and only a real `login()` fixes it; there's no automatic retry
+  loop. Two ways this triggers: proactively, before the WebView ever
+  loads — `ensureFreshTokens()` finds the access token expired (or expiring
+  soon) and a `refresh()` also fails; or reactively — the WebView actually
+  loaded somewhere other than expected and a `refresh()` triggered from
+  there also fails. `onSessionExpired` fires alongside either path.
 - Otherwise, the normal `loadingBuilder` → WebView flow.
 
 ### Back navigation and a header
@@ -206,6 +279,40 @@ Chat360LiveChatSDK(
 )
 ```
 
+## Push notifications
+
+This package never touches Firebase itself — `Chat360LiveAuth.login()` (and
+`withTokens`/`withJWT`) just take an `fcmToken` *string* to register via
+`mobile/notify`, and `Chat360LiveChatController.handleNotificationTap`
+just reads a data payload's `Room_Id`. The host owns everything about
+actually getting a token and a delivered push: its own Firebase project,
+`firebase_core`/`firebase_messaging`, and (verified end-to-end against a
+real APNs sandbox and a real dev-oem environment) this native wiring:
+
+- **Android**: apply the `com.google.gms.google-services` Gradle plugin,
+  drop the project's `google-services.json` into `android/app/`, and set
+  `minSdk` to at least 23 (firebase_messaging's own floor).
+- **iOS**: add `GoogleService-Info.plist` to the Xcode project as a bundled
+  resource (dragging it into Xcode isn't enough on its own — it must be in
+  the target's "Copy Bundle Resources" build phase), call
+  `FirebaseApp.configure()` in `AppDelegate.swift` before
+  `GeneratedPluginRegistrant.register`, enable the Push Notifications and
+  Background Modes (remote notification) capabilities — which need a
+  `Runner.entitlements` file with `aps-environment` and
+  `CODE_SIGN_ENTITLEMENTS` pointing to it — and raise the deployment target
+  to at least 15.0 (the Firebase iOS SDK's current floor; `pod install`
+  will say so if it's too low).
+- Fetch the token (`FirebaseMessaging.instance.getToken()`) after
+  requesting notification permission, and wire
+  `FirebaseMessaging.onMessageOpenedApp`/`getInitialMessage()` to
+  `chatController.handleNotificationTap`, as shown in the
+  [Opening a specific conversation](#opening-a-specific-conversation-eg-from-a-push-notification)
+  section above.
+
+See the [example app](example/lib/main.dart) for a complete, tested
+version of all of the above, including a "Simulate push tap" affordance
+for exercising the routing without needing a real push.
+
 ## Known limitation — blob: downloads
 
 File attachment/download hand-off works for a normal `https://` URL. It
@@ -214,13 +321,6 @@ rather than serving as a network resource) — that needs a JavaScript
 bridge to read the blob's contents, which isn't implemented yet. Flagging
 it here so it isn't mistaken for a bug when a specific attachment type
 doesn't download.
-
-## Not handled here
-
-- **Firebase setup itself** — `Chat360LiveAuth.login()` takes an `fcmToken`
-  *string*; it doesn't depend on `firebase_messaging` or initialize
-  Firebase. The host owns its own Firebase project and hands over the
-  token.
 
 ## License
 
