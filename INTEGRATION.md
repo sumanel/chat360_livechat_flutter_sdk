@@ -6,12 +6,7 @@ with the Chat360 credentials your admin portal issued, as opposed to a host
 that already has tokens from its own SSO (see `Chat360LiveAuth.withTokens` in
 the [README](README.md) for that case).
 
-SDK version: **0.0.1** (tagged [`0.0.1`](https://github.com/sumanel/chat360_livechat_flutter_sdk/releases/tag/0.0.1) in the repo)
-
-> Steps 8–10 (remote sign-out, multiple environments, push notifications)
-> describe behavior added since the `0.0.1` tag — see
-> [CHANGELOG.md](CHANGELOG.md#unreleased). If you pinned `ref: "0.0.1"` in
-> your `pubspec.yaml`, point at a later commit (or `main`) to get them.
+SDK version: **0.0.5** — see [CHANGELOG.md](CHANGELOG.md#005) for what's new.
 
 ---
 
@@ -23,7 +18,7 @@ dependencies:
   chat360_livechat_sdk:
     git:
       url: https://github.com/sumanel/chat360_livechat_flutter_sdk.git
-      ref: "0.0.1" # pin to the tagged release
+      ref: "0.0.5" # pin to the tagged release
   # — or, from a local checkout —
   # chat360_livechat_sdk:
   #   path: ../chat360_livechat_sdk

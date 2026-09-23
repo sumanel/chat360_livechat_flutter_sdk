@@ -26,7 +26,7 @@ Once it's on pub.dev:
 
 ```yaml
 dependencies:
-  chat360_livechat_sdk: ^0.0.1
+  chat360_livechat_sdk: ^0.0.5
 ```
 
 Then:
@@ -95,8 +95,7 @@ Chat360LiveAuth.withTokens(
 
 For the Hero mobile OEM SSO path specifically — an OEM JWT (e.g. Hero's)
 instead of either a Chat360 email/password or an existing token pair —
-use `withJWT`, which exchanges it via `POST /api/campaign-oem/sso/login`
-in the background:
+use `withJWT`:
 
 ```dart
 final auth = Chat360LiveAuth.withJWT(

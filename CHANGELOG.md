@@ -1,4 +1,4 @@
-## Unreleased
+## 0.0.5
 
 - **Fixed**: a session's `baseUrl` is now persisted and restored with it
   (`Chat360LiveAuth.baseUrl`) — previously, restoring a session on a later
