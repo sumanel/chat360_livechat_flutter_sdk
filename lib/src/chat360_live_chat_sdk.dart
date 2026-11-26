@@ -19,7 +19,7 @@ enum _Status {
   /// mid-flight through the sign-in/settle dance.
   loading,
 
-  /// Settled on `/live-chats` with its chrome hidden — the normal state.
+  /// Settled on `/live-chats` with its sidebar hidden — the normal state.
   ready,
 
   /// [Chat360LiveAuth.tokens] was null when this widget needed them, or became
@@ -99,13 +99,9 @@ class Chat360LiveChatController {
 ///    refresh silently before trying again; if [auth] has no session at
 ///    all, or a refresh can't recover one, the WebView never loads —
 ///    [signedOutBuilder] / [authErrorBuilder] show instead.
-/// 2. Hides the sidebar hamburger, the profile/logout menu, the responsive
-///    sidebar that otherwise reappears in landscape, and the surrounding
-///    desktop chrome (header bar, rounded/bordered card, reserved padding)
-///    via CSS, since this shell already provides its own native chrome and
-///    that reserved space otherwise just shrinks the usable surface. Hiding
-///    rather than click-blocking the hamburger/menu means those elements
-///    can't be hit-tested at all, portal or no portal.
+/// 2. Keeps the console's header, and hides via CSS the sidebar hamburger,
+///    the responsive sidebar that otherwise reappears in landscape, and the
+///    desktop card styling and side and bottom padding around the page.
 /// 3. Rewrites any navigation to `/live-chats/<id>` into `/chats/<id>` —
 ///    both real page loads and the in-app client-side route change that
 ///    happens when an agent taps a conversation.
@@ -168,7 +164,7 @@ class Chat360LiveChatSDK extends StatefulWidget {
   final Chat360LiveChatController? controller;
 
   /// Shown in place of the WebView until it's actually settled on
-  /// `/live-chats` with its chrome hidden. Covers the login-page flash and
+  /// `/live-chats` with its sidebar hidden. Covers the login-page flash and
   /// the intermediate redirect the console does on its way there, so the
   /// agent never sees that churn. Defaults to a centered spinner on a
   /// plain white background; pass a builder to match the host app's own
@@ -603,22 +599,19 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
           style.id = 'chat360-mobile-shell-style';
           document.head.appendChild(style);
         }
-        // #chat360__header_comp is the portal target PageHeader renders the
-        // profile/logout menu into; .mantine-Burger-root is Mantine v6's
-        // stable per-component class for the sidebar hamburger. The Burger
-        // is a sibling of #chat360__header_comp inside Topnav's outer
-        // Paper, not a descendant, so both rules are needed.
+        // The console's header, including its profile/logout menu, stays
+        // visible. .mantine-Burger-root is Mantine v6's stable
+        // per-component class for the header's sidebar hamburger, hidden
+        // because the sidebar it opens is hidden too.
         // .mantine-Navbar-root is the desktop sidebar (Layout.tsx) — it
         // only reappears once the viewport crosses Mantine's "sm" width
         // breakpoint, e.g. rotating the device to landscape, so it needs
         // hiding unconditionally rather than relying on that breakpoint.
-        // Beyond hiding those, containers/Layout.tsx also reserves a fixed
-        // 56px+ AppShell header slot and wraps the page in a padded,
-        // rounded, bordered Paper card — all designed for a desktop chrome
-        // this shell already provides natively, so they're stripped too
-        // rather than left as dead space. Scoped to .mantine-AppShell-main
-        // so it can't touch an unrelated Paper rendered elsewhere (e.g. a
-        // portaled dropdown).
+        // containers/Layout.tsx also wraps the page in a padded, rounded,
+        // bordered Paper card designed for desktop, so that is stripped.
+        // The top padding is left alone: it keeps content below the header.
+        // Scoped to .mantine-AppShell-main so it can't touch an unrelated
+        // Paper rendered elsewhere (e.g. a portaled dropdown).
         //
         // The single-conversation view (IndividualChat, /chats/:id) adds
         // its own ~12px left/right padding on the Chatbox's root Box
@@ -633,9 +626,8 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
         // 16px so that never triggers, on top of the meta viewport fix in
         // _disableViewportZoom.
         style.textContent =
-          '#chat360__header_comp, .mantine-Burger-root, .mantine-Navbar-root { display: none !important; }' +
-          '.mantine-Header-root { display: none !important; height: 0 !important; min-height: 0 !important; }' +
-          '.mantine-AppShell-main { padding: 0 !important; }' +
+          '.mantine-Burger-root, .mantine-Navbar-root { display: none !important; }' +
+          '.mantine-AppShell-main { padding-left: 0 !important; padding-right: 0 !important; padding-bottom: 0 !important; }' +
           '.mantine-AppShell-main .mantine-Paper-root { border: none !important; box-shadow: none !important; border-radius: 0 !important; }' +
           '.mantine-AppShell-main .mantine-Paper-root > .mantine-Flex-root > .mantine-Box-root { padding-left: 0 !important; padding-right: 0 !important; }' +
           'input, textarea, [contenteditable="true"] { font-size: 16px !important; }';

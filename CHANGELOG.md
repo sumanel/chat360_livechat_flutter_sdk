@@ -1,5 +1,8 @@
 ## 0.0.7
 
+- **Changed**: the console's header, including its profile and logout menu,
+  is no longer hidden. The sidebar and its menu button stay hidden. If you
+  pass `headerBuilder`, your header appears above the console's.
 - **Changed**: camera and microphone access is requested only when the chat
   page uses it, not when chat opens, and only while a page from the auth base
   URL is showing. On iOS the WebView shows the system prompt itself, so no

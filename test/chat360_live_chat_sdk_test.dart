@@ -375,6 +375,24 @@ void main() {
     expect(find.textContaining("Couldn't open"), findsOneWidget);
   });
 
+  testWidgets("the console's header stays visible", (tester) async {
+    await showSignedIn(tester);
+    webView.delegate.pageFinished(inbox);
+    await tester.pump();
+    webView.delegate.pageFinished(inbox);
+    await tester.pump();
+
+    final script = webView.scripts
+        .singleWhere((s) => s.contains('chat360-mobile-shell-style'));
+    final css = script.substring(script.indexOf('style.textContent'));
+    expect(css, isNot(contains('#chat360__header_comp')));
+    expect(css, isNot(contains('.mantine-Header-root')));
+    // The page's top padding is what keeps content below its header.
+    expect(css, isNot(contains('.mantine-AppShell-main { padding: 0 ')));
+    expect(css, contains('.mantine-Navbar-root'));
+    expect(css, contains('.mantine-Burger-root'));
+  });
+
   test('a notification without Room_Id is ignored', () async {
     await Chat360LiveChatController().handleNotificationTap({});
   });
