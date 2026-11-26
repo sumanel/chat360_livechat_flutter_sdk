@@ -26,7 +26,7 @@ Once it's on pub.dev:
 
 ```yaml
 dependencies:
-  chat360_livechat_sdk: ^0.0.6
+  chat360_livechat_sdk: ^0.0.7
 ```
 
 Then:
@@ -270,10 +270,20 @@ package can't add them on a consuming app's behalf:
   <string>Used for voice input in live chat conversations.</string>
   <key>NSCameraUsageDescription</key>
   <string>Used to attach photos in live chat conversations.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>Used to attach photos in live chat conversations.</string>
   ```
 
+No Podfile changes are needed. The SDK asks only when the chat page uses the
+camera or microphone: on Android through `permission_handler`, on iOS through
+the WebView's own system prompt. Access is given only while a page from the
+auth base URL is showing. `NSPhotoLibraryUsageDescription` is there because
+the upload plugins include photo library code, which App Store review checks
+for.
+
 Without `RECORD_AUDIO`/`CAMERA`, the permission request will simply be
-denied (or, on iOS, the app will crash immediately). `MODIFY_AUDIO_SETTINGS`
+denied (or, on iOS, the app will crash immediately without the Info.plist
+entries). `MODIFY_AUDIO_SETTINGS`
 is easy to miss since it's silent (a normal permission, no dialog) — without
 it, voice recording fails on Android with no visible error at all.
 
@@ -360,6 +370,16 @@ See the [example app](example/lib/main.dart) for a complete, tested
 version of all of the above, including a "Simulate push tap" affordance
 for exercising the routing without needing a real push.
 
+### When something doesn't work
+
+A denied camera or microphone (Android), a file that can't be attached, and a
+link or document that nothing can open are reported through
+`onActionError(message)`. Without it, the SDK shows the message in a
+`SnackBar`, which needs a `Scaffold` around the widget.
+
+Documents and links outside the chat open in another app, which doesn't share
+the chat sign-in.
+
 ## Known limitation — blob: downloads
 
 File attachment/download hand-off works for a normal `https://` URL. It
@@ -367,7 +387,8 @@ does **not** work for a `blob:` URL (a file the page builds client-side
 rather than serving as a network resource) — that needs a JavaScript
 bridge to read the blob's contents, which isn't implemented yet. Flagging
 it here so it isn't mistaken for a bug when a specific attachment type
-doesn't download.
+doesn't download. The agent sees the "couldn't open" message if the link
+reaches the SDK.
 
 ## License
 

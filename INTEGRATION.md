@@ -6,7 +6,7 @@ with the Chat360 credentials your admin portal issued, as opposed to a host
 that already has tokens from its own SSO (see `Chat360LiveAuth.withTokens` in
 the [README](README.md) for that case).
 
-SDK version: **0.0.6** — see [CHANGELOG.md](CHANGELOG.md#006) for what's new.
+SDK version: **0.0.7** — see [CHANGELOG.md](CHANGELOG.md#007) for what's new.
 
 ---
 
@@ -18,7 +18,7 @@ dependencies:
   chat360_livechat_sdk:
     git:
       url: https://github.com/sumanel/chat360_livechat_flutter_sdk.git
-      ref: "0.0.6" # pin to the tagged release
+      ref: "0.0.7" # pin to the tagged release
   # — or, from a local checkout —
   # chat360_livechat_sdk:
   #   path: ../chat360_livechat_sdk
@@ -383,7 +383,15 @@ The SDK can't add these to your app on its own — declare them yourself:
 <string>Used for voice input in live chat conversations.</string>
 <key>NSCameraUsageDescription</key>
 <string>Used to attach photos in live chat conversations.</string>
+<key>NSPhotoLibraryUsageDescription</key>
+<string>Used to attach photos in live chat conversations.</string>
 ```
+
+No Podfile changes are needed. Permissions are asked only when the chat page
+uses the camera or microphone. Pass `onActionError` to `Chat360LiveChatSDK` to
+show your own message when access is denied (Android), a file can't be
+attached, or a link or document can't be opened; the default is a `SnackBar`.
+`blob:` downloads aren't supported.
 
 Without `RECORD_AUDIO`/`CAMERA` the permission prompt is simply denied (iOS
 crashes immediately without the Info.plist entries). `MODIFY_AUDIO_SETTINGS`

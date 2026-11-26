@@ -1,7 +1,8 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart'
+    show debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -9,6 +10,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+import 'chat360_action_messages.dart';
+import 'chat360_file_selector.dart';
 import 'chat360_live_auth.dart';
 
 enum _Status {
@@ -16,7 +19,7 @@ enum _Status {
   /// mid-flight through the sign-in/settle dance.
   loading,
 
-  /// Settled on `/live-chats` with its chrome hidden — the normal state.
+  /// Settled on `/live-chats` with its sidebar hidden — the normal state.
   ready,
 
   /// [Chat360LiveAuth.tokens] was null when this widget needed them, or became
@@ -96,13 +99,9 @@ class Chat360LiveChatController {
 ///    refresh silently before trying again; if [auth] has no session at
 ///    all, or a refresh can't recover one, the WebView never loads —
 ///    [signedOutBuilder] / [authErrorBuilder] show instead.
-/// 2. Hides the sidebar hamburger, the profile/logout menu, the responsive
-///    sidebar that otherwise reappears in landscape, and the surrounding
-///    desktop chrome (header bar, rounded/bordered card, reserved padding)
-///    via CSS, since this shell already provides its own native chrome and
-///    that reserved space otherwise just shrinks the usable surface. Hiding
-///    rather than click-blocking the hamburger/menu means those elements
-///    can't be hit-tested at all, portal or no portal.
+/// 2. Keeps the console's header, and hides via CSS the sidebar hamburger,
+///    the responsive sidebar that otherwise reappears in landscape, and the
+///    desktop card styling and side and bottom padding around the page.
 /// 3. Rewrites any navigation to `/live-chats/<id>` into `/chats/<id>` —
 ///    both real page loads and the in-app client-side route change that
 ///    happens when an agent taps a conversation.
@@ -111,10 +110,12 @@ class Chat360LiveChatController {
 ///    `/live-chats`; anything that isn't part of the console at all (an
 ///    external site, a file attachment) is handed to the OS instead of
 ///    loading inside the shell.
-/// 5. Grants microphone/camera access to the page (for voice input and
-///    camera attachments) once the OS-level runtime permission has been
-///    approved, and wires up the native file picker so attaching a file
-///    actually opens one instead of doing nothing.
+/// 5. Gives the page microphone/camera access (for voice input and camera
+///    attachments) only when it asks, and only while a page from the auth
+///    base URL is showing. On Android the OS permission is requested at that
+///    moment; on iOS the WebView shows the system prompt itself. It also
+///    wires up the native file picker on Android, and reports failures
+///    through [onActionError].
 /// 6. Floors every input's font-size at 16px and forces the viewport meta
 ///    tag to disable zoom — WebKit auto-zooms in on a focused input under
 ///    16px and can leave the page stuck zoomed in after the keyboard
@@ -150,6 +151,7 @@ class Chat360LiveChatSDK extends StatefulWidget {
     this.onExitRequested,
     this.headerBuilder,
     this.onWebResourceError,
+    this.onActionError,
   });
 
   /// Owns the agent's Chat360 session — login, logout, and silent token
@@ -162,7 +164,7 @@ class Chat360LiveChatSDK extends StatefulWidget {
   final Chat360LiveChatController? controller;
 
   /// Shown in place of the WebView until it's actually settled on
-  /// `/live-chats` with its chrome hidden. Covers the login-page flash and
+  /// `/live-chats` with its sidebar hidden. Covers the login-page flash and
   /// the intermediate redirect the console does on its way there, so the
   /// agent never sees that churn. Defaults to a centered spinner on a
   /// plain white background; pass a builder to match the host app's own
@@ -209,6 +211,12 @@ class Chat360LiveChatSDK extends StatefulWidget {
   })? headerBuilder;
 
   final void Function(WebResourceError error)? onWebResourceError;
+
+  /// Called with a short, agent-facing message when something the agent
+  /// tried didn't work: camera or microphone access is off, a file couldn't
+  /// be attached, or a link or document couldn't be opened. Leave null to
+  /// show it in a `SnackBar`, which needs a [Scaffold] around this widget.
+  final void Function(String message)? onActionError;
 
   @override
   State<Chat360LiveChatSDK> createState() => _Chat360LiveChatSDKState();
@@ -263,12 +271,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     widget.auth.addListener(_onAuthChanged);
     widget.controller?._attach(this);
     _controller = WebViewController(
-      onPermissionRequest: (request) async {
-        // Grants the *web page's* getUserMedia() request — this is
-        // separate from, and only meaningful after, the OS-level runtime
-        // permission requested in _ensureMediaPermissions below.
-        await request.grant();
-      },
+      onPermissionRequest: _onPermissionRequest,
     )
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(
@@ -468,9 +471,30 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     // inside this shell; hand them to the OS instead of just discarding
     // them, so attachments/downloads still work.
     if (uri != null) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      unawaited(_openExternally(uri));
     }
     return NavigationDecision.prevent;
+  }
+
+  Future<void> _openExternally(Uri uri) async {
+    var opened = false;
+    try {
+      opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      debugPrint('Chat360LiveChatSDK: could not open a link: $e');
+    }
+    if (!opened) _reportActionError(Chat360ActionMessages.openFailed);
+  }
+
+  void _reportActionError(String message) {
+    if (!mounted) return;
+    final handler = widget.onActionError;
+    if (handler != null) {
+      handler(message);
+      return;
+    }
+    ScaffoldMessenger.maybeOf(context)
+        ?.showSnackBar(SnackBar(content: Text(message)));
   }
 
   bool _isAllowedPath(Uri uri) {
@@ -539,7 +563,6 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     await _hideChromeForEmbed();
     await _disableViewportZoom();
     await _installClientSideRouteGuard();
-    await _ensureMediaPermissions();
     if (mounted) {
       setState(() => _status = _Status.ready);
     }
@@ -576,22 +599,19 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
           style.id = 'chat360-mobile-shell-style';
           document.head.appendChild(style);
         }
-        // #chat360__header_comp is the portal target PageHeader renders the
-        // profile/logout menu into; .mantine-Burger-root is Mantine v6's
-        // stable per-component class for the sidebar hamburger. The Burger
-        // is a sibling of #chat360__header_comp inside Topnav's outer
-        // Paper, not a descendant, so both rules are needed.
+        // The console's header, including its profile/logout menu, stays
+        // visible. .mantine-Burger-root is Mantine v6's stable
+        // per-component class for the header's sidebar hamburger, hidden
+        // because the sidebar it opens is hidden too.
         // .mantine-Navbar-root is the desktop sidebar (Layout.tsx) — it
         // only reappears once the viewport crosses Mantine's "sm" width
         // breakpoint, e.g. rotating the device to landscape, so it needs
         // hiding unconditionally rather than relying on that breakpoint.
-        // Beyond hiding those, containers/Layout.tsx also reserves a fixed
-        // 56px+ AppShell header slot and wraps the page in a padded,
-        // rounded, bordered Paper card — all designed for a desktop chrome
-        // this shell already provides natively, so they're stripped too
-        // rather than left as dead space. Scoped to .mantine-AppShell-main
-        // so it can't touch an unrelated Paper rendered elsewhere (e.g. a
-        // portaled dropdown).
+        // containers/Layout.tsx also wraps the page in a padded, rounded,
+        // bordered Paper card designed for desktop, so that is stripped.
+        // The top padding is left alone: it keeps content below the header.
+        // Scoped to .mantine-AppShell-main so it can't touch an unrelated
+        // Paper rendered elsewhere (e.g. a portaled dropdown).
         //
         // The single-conversation view (IndividualChat, /chats/:id) adds
         // its own ~12px left/right padding on the Chatbox's root Box
@@ -606,9 +626,8 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
         // 16px so that never triggers, on top of the meta viewport fix in
         // _disableViewportZoom.
         style.textContent =
-          '#chat360__header_comp, .mantine-Burger-root, .mantine-Navbar-root { display: none !important; }' +
-          '.mantine-Header-root { display: none !important; height: 0 !important; min-height: 0 !important; }' +
-          '.mantine-AppShell-main { padding: 0 !important; }' +
+          '.mantine-Burger-root, .mantine-Navbar-root { display: none !important; }' +
+          '.mantine-AppShell-main { padding-left: 0 !important; padding-right: 0 !important; padding-bottom: 0 !important; }' +
           '.mantine-AppShell-main .mantine-Paper-root { border: none !important; box-shadow: none !important; border-radius: 0 !important; }' +
           '.mantine-AppShell-main .mantine-Paper-root > .mantine-Flex-root > .mantine-Box-root { padding-left: 0 !important; padding-right: 0 !important; }' +
           'input, textarea, [contenteditable="true"] { font-size: 16px !important; }';
@@ -702,45 +721,90 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     ''');
   }
 
-  /// Requests the OS-level microphone (and, on Android, camera) runtime
-  /// permission so the grant() in setOnPlatformPermissionRequest above
-  /// actually has something to grant — the web page's getUserMedia() will
-  /// silently fail if the app itself was never given the permission.
+  /// Answers the page's getUserMedia() request.
   ///
-  /// The host app must declare these in its own AndroidManifest.xml
+  /// The host app must declare the permissions in its own AndroidManifest.xml
   /// (`RECORD_AUDIO`, `CAMERA`) and Info.plist
   /// (`NSMicrophoneUsageDescription`, `NSCameraUsageDescription`) — a Dart
   /// package can't add those on a consuming app's behalf.
-  Future<void> _ensureMediaPermissions() async {
-    await [Permission.microphone, Permission.camera].request();
+  Future<void> _onPermissionRequest(WebViewPermissionRequest request) async {
+    final types = request.types;
+    const supported = {
+      WebViewPermissionResourceType.camera,
+      WebViewPermissionResourceType.microphone,
+    };
+    if (types.isEmpty ||
+        !supported.containsAll(types) ||
+        !await _isShowingConsole()) {
+      await request.deny();
+      return;
+    }
+    // Not asked here on iOS: WKWebView shows the system prompt itself, and
+    // permission_handler only works there with extra Podfile settings.
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      if (types.contains(WebViewPermissionResourceType.camera) &&
+          !await _requestPermission(Permission.camera)) {
+        _reportActionError(Chat360ActionMessages.cameraOff);
+        await request.deny();
+        return;
+      }
+      if (types.contains(WebViewPermissionResourceType.microphone) &&
+          !await _requestPermission(Permission.microphone)) {
+        _reportActionError(Chat360ActionMessages.microphoneOff);
+        await request.deny();
+        return;
+      }
+    }
+    await request.grant();
+  }
+
+  /// Whether the top-level page is from the auth base URL's origin. The
+  /// request itself doesn't say which frame made it.
+  Future<bool> _isShowingConsole() async {
+    final current = Uri.tryParse(await _controller.currentUrl() ?? '');
+    final base = Uri.parse(_baseUrl);
+    return current != null &&
+        current.scheme == base.scheme &&
+        current.host == base.host &&
+        current.port == base.port;
+  }
+
+  Future<bool> _requestPermission(Permission permission) async {
+    try {
+      return (await permission.request()).isGranted;
+    } catch (e) {
+      // For example, another permission request is already on screen.
+      debugPrint('Chat360LiveChatSDK: permission request failed: $e');
+      return false;
+    }
   }
 
   /// Handles Android's file-chooser callback for `<input type="file">`.
-  ///
-  /// `file_picker` only ever browses existing files, so a plain page
-  /// `<input type="file">` uses it as-is. But `params.isCaptureEnabled`
-  /// (set when the page adds a `capture` attribute, e.g. for a "take a
-  /// photo" attachment button) means the page wants the camera directly —
-  /// `file_picker` has no camera UI, so that case goes through
-  /// `image_picker`'s `ImageSource.camera` instead.
-  Future<List<String>> _onShowFileSelector(FileSelectorParams params) async {
-    if (params.isCaptureEnabled) {
-      final wantsVideo =
-          params.acceptTypes.any((type) => type.startsWith('video/'));
-      final picker = ImagePicker();
-      final file = wantsVideo
-          ? await picker.pickVideo(source: ImageSource.camera)
-          : await picker.pickImage(source: ImageSource.camera);
-      return file == null ? const [] : [Uri.file(file.path).toString()];
-    }
-
-    final result = await FilePicker.platform.pickFiles(
+  Future<List<String>> _onShowFileSelector(FileSelectorParams params) {
+    return Chat360FileSelector(
+      requestCamera: () => _requestPermission(Permission.camera),
+      capture: ({required video}) async {
+        final picker = ImagePicker();
+        final file = video
+            ? await picker.pickVideo(source: ImageSource.camera)
+            : await picker.pickImage(source: ImageSource.camera);
+        return file?.path;
+      },
+      pick: ({required type, extensions, required allowMultiple}) async {
+        final result = await FilePicker.platform.pickFiles(
+          type: type,
+          allowedExtensions: extensions,
+          allowMultiple: allowMultiple,
+          withReadStream: false,
+        );
+        return result?.paths.whereType<String>().toList() ?? const [];
+      },
+      onError: _reportActionError,
+    ).select(
+      captureEnabled: params.isCaptureEnabled,
+      acceptTypes: params.acceptTypes,
       allowMultiple: params.mode == FileSelectorMode.openMultiple,
-      type: FileType.any,
-      withReadStream: false,
     );
-    final paths = result?.paths.whereType<String>() ?? const <String>[];
-    return paths.map((path) => Uri.file(path).toString()).toList();
   }
 
   String _jsString(String value) {

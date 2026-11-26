@@ -1,6 +1,6 @@
 name: chat360_livechat_sdk
 description: "Chat360LiveChatSDK — embeds the Chat360 business live-chat console (app.chat360.io) as an already-authenticated, mobile-shell view."
-version: 0.0.6
+version: 0.0.7
 repository: https://github.com/sumanel/chat360_livechat_flutter_sdk
 
 publish_to: none
@@ -28,3 +28,5 @@ dev_dependencies:
   flutter_lints: ^3.0.0
   # Test-only: fakes the WebView in widget tests.
   webview_flutter_platform_interface: ^2.0.0
+  # Test-only: fakes link opening.
+  url_launcher_platform_interface: ^2.0.0
