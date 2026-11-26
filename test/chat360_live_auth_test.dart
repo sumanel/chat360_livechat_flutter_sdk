@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:chat360_livechat_sdk/chat360_livechat_sdk.dart';
@@ -76,6 +77,57 @@ String _jwtExpiringAt(DateTime expiry) {
   final header = segment({'alg': 'none', 'typ': 'JWT'});
   final payload = segment({'exp': expiry.millisecondsSinceEpoch ~/ 1000});
   return '$header.$payload.signature';
+}
+
+/// A stateful fake of the Chat360 endpoints the SSO flow touches. Each
+/// successful exchange issues numbered tokens; agent N is `agentN@x.com`.
+class _SsoServer {
+  final log = <_Recorded>[];
+  int ssoStatus = 200;
+  int refreshStatus = 200;
+  int deleteStatus = 200;
+  Completer<void>? ssoGate;
+  var _issued = 0;
+  final _emails = <String, String>{};
+
+  Iterable<_Recorded> calls(String key) =>
+      log.where((r) => '${r.method} ${r.url.path}' == key);
+
+  late final http.Client client = MockClient((request) async {
+    log.add(_Recorded(request.method, request.url, request.body));
+    switch ('${request.method} ${request.url.path}') {
+      case 'POST /api/campaign-oem/sso/login':
+        await ssoGate?.future;
+        if (ssoStatus != 200) {
+          return _fail(ssoStatus,
+              {'message': 'Dealer mapping not found for this login.'});
+        }
+        final loginId =
+            (jsonDecode(request.body) as Map)['extra']['loginId'] as String;
+        _issued++;
+        _emails['Bearer access-$_issued'] =
+            'agent${loginId.substring(1)}@x.com';
+        return _ok({
+          'accessToken': 'access-$_issued',
+          'refreshToken': 'refresh-$_issued',
+        });
+      case 'POST /api/auth/wesite-login-user':
+        return _ok({'access': 'pw-a', 'refresh': 'pw-r'});
+      case 'POST /api/auth/token/refresh/':
+        if (refreshStatus != 200) return _fail(refreshStatus);
+        final token = 'refreshed-${log.length}';
+        return _ok({'access': token});
+      case 'GET /api/auth/user':
+        return _ok({'email': _emails[request.headers['Authorization']]});
+      case 'POST /api/mobile/notify':
+        return _ok({});
+      case 'DELETE /api/mobile/notify':
+        return http.Response('', deleteStatus);
+      case 'GET /api/auth/logout':
+        return _ok({});
+    }
+    return http.Response('not stubbed', 404);
+  });
 }
 
 void main() {
@@ -932,6 +984,347 @@ void main() {
         auth.login(email: 'x@y.com', password: 'x', fcmToken: 'fcm-1'),
         completes,
       );
+    });
+  });
+
+  group('Campaign OEM SSO session rules', () {
+    Chat360JWTTokens jwtFor(String loginId) => Chat360JWTTokens(
+          clientId: 'heromotocorp',
+          jwtToken: 'hero-jwt-$loginId',
+          extra: {
+            'loginId': loginId,
+            'dealerCode': 'D1',
+            'divisionName': 'Main',
+          },
+        );
+
+    test(
+        'rejected refresh re-exchanges fresh credentials once, keeps the '
+        'agent signed in and re-registers push', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          fcmToken: 'fcm-1',
+          httpClient: server.client,
+          storage: _FakeSecureStore());
+      var expired = 0;
+      var asked = 0;
+      auth.onSessionExpired = () => expired++;
+      auth.getCredentials = () async {
+        asked++;
+        return jwtFor('L1');
+      };
+      await pumpEventQueue();
+      server.log.clear();
+      server.refreshStatus = 401;
+
+      final result = await auth.refresh();
+
+      expect(result?.accessToken, 'access-2');
+      expect(auth.tokens?.refreshToken, 'refresh-2');
+      expect(asked, 1);
+      expect(expired, 0);
+      expect(server.calls('POST /api/campaign-oem/sso/login'), hasLength(1));
+      expect(server.calls('POST /api/mobile/notify').single.json['fcm_token'],
+          'fcm-1');
+    });
+
+    test('concurrent refresh calls share one re-exchange', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      auth.getCredentials = () async => jwtFor('L1');
+      await pumpEventQueue();
+      server.log.clear();
+      server.refreshStatus = 401;
+
+      await Future.wait([auth.refresh(), auth.refresh()]);
+
+      expect(server.calls('POST /api/campaign-oem/sso/login'), hasLength(1));
+    });
+
+    test('a rejected re-exchange expires the session exactly once', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      var expired = 0;
+      auth.onSessionExpired = () => expired++;
+      auth.getCredentials = () async => jwtFor('L1');
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+      server.ssoStatus = 400;
+
+      expect(await auth.refresh(), isNull);
+
+      expect(auth.tokens, isNull);
+      expect(expired, 1);
+      expect(auth.lastSsoError, 'Dealer mapping not found for this login.');
+    });
+
+    test('a throwing getCredentials expires the session', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      var expired = 0;
+      auth.onSessionExpired = () => expired++;
+      auth.getCredentials = () async => throw Exception('host signed out');
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+
+      expect(await auth.refresh(), isNull);
+
+      expect(auth.tokens, isNull);
+      expect(expired, 1);
+    });
+
+    test('a server error during re-exchange keeps the session for retry',
+        () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      var expired = 0;
+      auth.onSessionExpired = () => expired++;
+      auth.getCredentials = () async => jwtFor('L1');
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+      server.ssoStatus = 503;
+
+      expect(await auth.refresh(), isNull);
+
+      expect(auth.tokens?.accessToken, 'access-1');
+      expect(expired, 0);
+    });
+
+    test('a password session never falls back to OEM SSO', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth(
+          httpClient: server.client, storage: _FakeSecureStore());
+      var asked = 0;
+      auth.getCredentials = () async {
+        asked++;
+        return jwtFor('L1');
+      };
+      await auth.login(email: 'a@x.com', password: 'p');
+      server.refreshStatus = 401;
+
+      await auth.refresh();
+
+      expect(asked, 0);
+      expect(auth.tokens, isNull);
+    });
+
+    test('a restored SSO session can still re-exchange', () async {
+      final server = _SsoServer();
+      final store = _FakeSecureStore();
+      Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: store);
+      await pumpEventQueue();
+      Chat360LiveAuth.reset();
+
+      final auth = Chat360LiveAuth(httpClient: server.client, storage: store);
+      auth.getCredentials = () async => jwtFor('L1');
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+
+      expect((await auth.refresh())?.accessToken, 'access-2');
+    });
+
+    test('logout during a re-exchange is not undone by its late result',
+        () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      final gate = Completer<Chat360JWTTokens>();
+      auth.getCredentials = () => gate.future;
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+
+      final refreshing = auth.refresh();
+      await pumpEventQueue();
+      await auth.logout();
+      gate.complete(jwtFor('L1'));
+      await refreshing;
+
+      expect(auth.tokens, isNull);
+    });
+
+    test('logout during the first exchange is not undone', () async {
+      final server = _SsoServer()..ssoGate = Completer<void>();
+      final store = _FakeSecureStore();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: store);
+      await pumpEventQueue();
+
+      await auth.logout();
+      server.ssoGate!.complete();
+      await pumpEventQueue();
+
+      expect(auth.tokens, isNull);
+      expect(auth.isRestoring, isFalse);
+      expect(store.data.containsKey('chat360_access_token'), isFalse);
+      expect(server.calls('GET /api/auth/logout'), hasLength(1),
+          reason: 'the unwanted new tokens must be invalidated');
+    });
+
+    test('switching agents registers push under the new email', () async {
+      final server = _SsoServer();
+      Chat360LiveAuth.withJWT(jwtFor('L1'),
+          fcmToken: 'fcm-1',
+          httpClient: server.client,
+          storage: _FakeSecureStore());
+      await pumpEventQueue();
+      server.log.clear();
+
+      Chat360LiveAuth.withJWT(jwtFor('L2'), fcmToken: 'fcm-1');
+      await pumpEventQueue();
+
+      expect(server.calls('DELETE /api/mobile/notify').first.json['email'],
+          'agent1@x.com');
+      expect(server.calls('POST /api/mobile/notify').single.json['email'],
+          'agent2@x.com');
+    });
+
+    test(
+        'a different loginId ends the old agent even if its own exchange '
+        'fails', () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          fcmToken: 'fcm-1',
+          httpClient: server.client,
+          storage: _FakeSecureStore());
+      await pumpEventQueue();
+      server.ssoStatus = 400;
+
+      Chat360LiveAuth.withJWT(jwtFor('L2'));
+      await pumpEventQueue();
+
+      expect(auth.tokens, isNull);
+      expect(server.calls('GET /api/auth/logout'), hasLength(1));
+      expect(server.calls('DELETE /api/mobile/notify'), hasLength(1));
+    });
+
+    test('the same loginId keeps its session when a new exchange fails',
+        () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      await pumpEventQueue();
+      server.ssoStatus = 400;
+
+      Chat360LiveAuth.withJWT(jwtFor('L1'));
+      await pumpEventQueue();
+
+      expect(auth.tokens?.accessToken, 'access-1');
+      expect(auth.lastSsoError, isNotNull);
+    });
+
+    test('cold start with SSO logs out and unregisters the saved agent',
+        () async {
+      final server = _SsoServer();
+      final store = _FakeSecureStore();
+      Chat360LiveAuth.withJWT(jwtFor('L1'),
+          fcmToken: 'fcm-1', httpClient: server.client, storage: store);
+      await pumpEventQueue();
+      Chat360LiveAuth.reset();
+      server.log.clear();
+
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L2'),
+          httpClient: server.client, storage: store);
+      expect(auth.tokens, isNull);
+      await pumpEventQueue();
+
+      expect(auth.tokens?.accessToken, 'access-2');
+      expect(
+          server
+              .calls('GET /api/auth/logout')
+              .single
+              .url
+              .queryParameters['refresh_token'],
+          'refresh-1');
+      expect(server.calls('DELETE /api/mobile/notify').single.json['email'],
+          'agent1@x.com');
+    });
+
+    test('a failed push removal is kept and retried with the next session',
+        () async {
+      final server = _SsoServer();
+      final store = _FakeSecureStore();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          fcmToken: 'fcm-1', httpClient: server.client, storage: store);
+      await pumpEventQueue();
+      server.refreshStatus = 401;
+      server.deleteStatus = 401;
+      await auth.refresh();
+      expect(store.data.containsKey('chat360_pending_fcm_removal'), isTrue);
+      server.log.clear();
+      server.deleteStatus = 200;
+
+      Chat360LiveAuth.withJWT(jwtFor('L2'), fcmToken: 'fcm-1');
+      await pumpEventQueue();
+
+      expect(server.calls('DELETE /api/mobile/notify').single.json['email'],
+          'agent1@x.com');
+      expect(store.data.containsKey('chat360_pending_fcm_removal'), isFalse);
+      expect(
+        server.log.indexWhere((r) => r.method == 'DELETE'),
+        lessThan(server.log.indexWhere(
+            (r) => r.method == 'POST' && r.url.path.endsWith('notify'))),
+        reason: 'removal must not delete the new registration',
+      );
+    });
+
+    for (final withProvider in [false, true]) {
+      test(
+          'a dead old session does not discard an exchange in flight '
+          '(getCredentials set: $withProvider)', () async {
+        final server = _SsoServer();
+        final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+            httpClient: server.client, storage: _FakeSecureStore());
+        var expired = 0;
+        var asked = 0;
+        auth.onSessionExpired = () => expired++;
+        if (withProvider) {
+          auth.getCredentials = () async {
+            asked++;
+            return jwtFor('L1');
+          };
+        }
+        await pumpEventQueue();
+        server.ssoGate = Completer<void>();
+        server.refreshStatus = 401;
+
+        Chat360LiveAuth.withJWT(jwtFor('L1'));
+        await pumpEventQueue();
+        await auth.refresh();
+        server.ssoGate!.complete();
+        await pumpEventQueue();
+
+        expect(auth.tokens?.accessToken, 'access-2');
+        expect(asked, 0);
+        expect(expired, 0);
+      });
+    }
+
+    test('web storage owner is stable for one agent, differs between agents',
+        () async {
+      final server = _SsoServer();
+      final auth = Chat360LiveAuth.withJWT(jwtFor('L1'),
+          httpClient: server.client, storage: _FakeSecureStore());
+      await pumpEventQueue();
+      final first = auth.webStorageOwner;
+      final revision = auth.sessionRevision;
+
+      await auth.refresh();
+      expect(auth.sessionRevision, revision,
+          reason: 'a plain refresh is the same session');
+
+      Chat360LiveAuth.withJWT(jwtFor('L1'));
+      await pumpEventQueue();
+      expect(auth.webStorageOwner, first);
+      expect(auth.sessionRevision, greaterThan(revision));
+
+      Chat360LiveAuth.withJWT(jwtFor('L2'));
+      await pumpEventQueue();
+      expect(auth.webStorageOwner, isNot(first));
     });
   });
 }

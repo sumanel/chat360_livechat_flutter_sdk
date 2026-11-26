@@ -6,7 +6,7 @@ with the Chat360 credentials your admin portal issued, as opposed to a host
 that already has tokens from its own SSO (see `Chat360LiveAuth.withTokens` in
 the [README](README.md) for that case).
 
-SDK version: **0.0.5** — see [CHANGELOG.md](CHANGELOG.md#005) for what's new.
+SDK version: **0.0.6** — see [CHANGELOG.md](CHANGELOG.md#006) for what's new.
 
 ---
 
@@ -18,7 +18,7 @@ dependencies:
   chat360_livechat_sdk:
     git:
       url: https://github.com/sumanel/chat360_livechat_flutter_sdk.git
-      ref: "0.0.5" # pin to the tagged release
+      ref: "0.0.6" # pin to the tagged release
   # — or, from a local checkout —
   # chat360_livechat_sdk:
   #   path: ../chat360_livechat_sdk
@@ -199,6 +199,52 @@ call `Chat360LiveAuth()`. `auth.tokens` stays null and `auth.isRestoring`
 stays true until the exchange resolves, same as a persisted session still
 loading. On failure, `auth.lastSsoError` carries the API's message (e.g.
 `"Dealer mapping not found for this login."`) to show as-is.
+
+Chat360 SSO goes through the Campaign OEM API,
+`POST {baseUrl}/api/campaign-oem/sso/login`. The SDK sends `clientId`,
+`token` (the OEM JWT) and `extra`, and reads back `accessToken` and
+`refreshToken`. On an error it shows the API's `message`.
+
+#### Automatic re-login (`getCredentials`)
+
+Set `getCredentials` on every app run, so that an SSO session can recover
+when Chat360 rejects its refresh token:
+
+```dart
+auth.getCredentials = () async => Chat360JWTTokens(
+  clientId: 'heromotocorp',
+  jwtToken: await mySession.freshOemJwt(), // throw if signed out
+  extra: {
+    'loginId': loginId,
+    'dealerCode': dealerCode,
+    'divisionName': divisionName,
+  },
+);
+```
+
+The SDK asks once and exchanges the result. `onSessionExpired` fires only if
+that fails: the callback throws or takes over 30 seconds, or the API rejects
+the exchange (4xx). A network or 5xx failure keeps the session for a later
+retry. Sessions from `login()` or `withTokens()` never use the callback.
+
+The SDK notices a rejected refresh token when it refreshes: when the chat
+view loads, or when you call `refresh()` / `ensureFreshTokens()`. It does
+not detect the web console signing out while the view is already open, and
+nothing runs while the app is closed.
+
+#### Switching agents and logging out
+
+- `withJWT` with a different `loginId` logs out and unregisters the previous
+  agent first, even if the new exchange then fails. With the same
+  `loginId`, the old session is kept until the new one succeeds.
+- `logout()` cancels any sign-in still in progress.
+- `Chat360LiveChatSDK` reloads for each new session. When a session ends, a
+  mounted view clears the console's `localStorage` and `sessionStorage`. If
+  no view is mounted, leftover storage is cleared before a different agent's
+  session is loaded. Other WebViews in your app are not touched.
+- If removing a push registration fails, the SDK saves it and retries with
+  the next session on the same `baseUrl`. The server may refuse the retry,
+  so it should also drop registrations for sessions it has ended.
 
 ---
 
