@@ -1,7 +1,8 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
+import 'package:flutter/foundation.dart'
+    show debugPrint, defaultTargetPlatform, kDebugMode;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -9,6 +10,8 @@ import 'package:url_launcher/url_launcher.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
+import 'chat360_action_messages.dart';
+import 'chat360_file_selector.dart';
 import 'chat360_live_auth.dart';
 
 enum _Status {
@@ -111,10 +114,12 @@ class Chat360LiveChatController {
 ///    `/live-chats`; anything that isn't part of the console at all (an
 ///    external site, a file attachment) is handed to the OS instead of
 ///    loading inside the shell.
-/// 5. Grants microphone/camera access to the page (for voice input and
-///    camera attachments) once the OS-level runtime permission has been
-///    approved, and wires up the native file picker so attaching a file
-///    actually opens one instead of doing nothing.
+/// 5. Gives the page microphone/camera access (for voice input and camera
+///    attachments) only when it asks, and only while a page from the auth
+///    base URL is showing. On Android the OS permission is requested at that
+///    moment; on iOS the WebView shows the system prompt itself. It also
+///    wires up the native file picker on Android, and reports failures
+///    through [onActionError].
 /// 6. Floors every input's font-size at 16px and forces the viewport meta
 ///    tag to disable zoom — WebKit auto-zooms in on a focused input under
 ///    16px and can leave the page stuck zoomed in after the keyboard
@@ -150,6 +155,7 @@ class Chat360LiveChatSDK extends StatefulWidget {
     this.onExitRequested,
     this.headerBuilder,
     this.onWebResourceError,
+    this.onActionError,
   });
 
   /// Owns the agent's Chat360 session — login, logout, and silent token
@@ -210,6 +216,12 @@ class Chat360LiveChatSDK extends StatefulWidget {
 
   final void Function(WebResourceError error)? onWebResourceError;
 
+  /// Called with a short, agent-facing message when something the agent
+  /// tried didn't work: camera or microphone access is off, a file couldn't
+  /// be attached, or a link or document couldn't be opened. Leave null to
+  /// show it in a `SnackBar`, which needs a [Scaffold] around this widget.
+  final void Function(String message)? onActionError;
+
   @override
   State<Chat360LiveChatSDK> createState() => _Chat360LiveChatSDKState();
 }
@@ -263,12 +275,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     widget.auth.addListener(_onAuthChanged);
     widget.controller?._attach(this);
     _controller = WebViewController(
-      onPermissionRequest: (request) async {
-        // Grants the *web page's* getUserMedia() request — this is
-        // separate from, and only meaningful after, the OS-level runtime
-        // permission requested in _ensureMediaPermissions below.
-        await request.grant();
-      },
+      onPermissionRequest: _onPermissionRequest,
     )
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..setNavigationDelegate(
@@ -468,9 +475,30 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     // inside this shell; hand them to the OS instead of just discarding
     // them, so attachments/downloads still work.
     if (uri != null) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
+      unawaited(_openExternally(uri));
     }
     return NavigationDecision.prevent;
+  }
+
+  Future<void> _openExternally(Uri uri) async {
+    var opened = false;
+    try {
+      opened = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    } catch (e) {
+      debugPrint('Chat360LiveChatSDK: could not open a link: $e');
+    }
+    if (!opened) _reportActionError(Chat360ActionMessages.openFailed);
+  }
+
+  void _reportActionError(String message) {
+    if (!mounted) return;
+    final handler = widget.onActionError;
+    if (handler != null) {
+      handler(message);
+      return;
+    }
+    ScaffoldMessenger.maybeOf(context)
+        ?.showSnackBar(SnackBar(content: Text(message)));
   }
 
   bool _isAllowedPath(Uri uri) {
@@ -539,7 +567,6 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     await _hideChromeForEmbed();
     await _disableViewportZoom();
     await _installClientSideRouteGuard();
-    await _ensureMediaPermissions();
     if (mounted) {
       setState(() => _status = _Status.ready);
     }
@@ -702,45 +729,90 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
     ''');
   }
 
-  /// Requests the OS-level microphone (and, on Android, camera) runtime
-  /// permission so the grant() in setOnPlatformPermissionRequest above
-  /// actually has something to grant — the web page's getUserMedia() will
-  /// silently fail if the app itself was never given the permission.
+  /// Answers the page's getUserMedia() request.
   ///
-  /// The host app must declare these in its own AndroidManifest.xml
+  /// The host app must declare the permissions in its own AndroidManifest.xml
   /// (`RECORD_AUDIO`, `CAMERA`) and Info.plist
   /// (`NSMicrophoneUsageDescription`, `NSCameraUsageDescription`) — a Dart
   /// package can't add those on a consuming app's behalf.
-  Future<void> _ensureMediaPermissions() async {
-    await [Permission.microphone, Permission.camera].request();
+  Future<void> _onPermissionRequest(WebViewPermissionRequest request) async {
+    final types = request.types;
+    const supported = {
+      WebViewPermissionResourceType.camera,
+      WebViewPermissionResourceType.microphone,
+    };
+    if (types.isEmpty ||
+        !supported.containsAll(types) ||
+        !await _isShowingConsole()) {
+      await request.deny();
+      return;
+    }
+    // Not asked here on iOS: WKWebView shows the system prompt itself, and
+    // permission_handler only works there with extra Podfile settings.
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      if (types.contains(WebViewPermissionResourceType.camera) &&
+          !await _requestPermission(Permission.camera)) {
+        _reportActionError(Chat360ActionMessages.cameraOff);
+        await request.deny();
+        return;
+      }
+      if (types.contains(WebViewPermissionResourceType.microphone) &&
+          !await _requestPermission(Permission.microphone)) {
+        _reportActionError(Chat360ActionMessages.microphoneOff);
+        await request.deny();
+        return;
+      }
+    }
+    await request.grant();
+  }
+
+  /// Whether the top-level page is from the auth base URL's origin. The
+  /// request itself doesn't say which frame made it.
+  Future<bool> _isShowingConsole() async {
+    final current = Uri.tryParse(await _controller.currentUrl() ?? '');
+    final base = Uri.parse(_baseUrl);
+    return current != null &&
+        current.scheme == base.scheme &&
+        current.host == base.host &&
+        current.port == base.port;
+  }
+
+  Future<bool> _requestPermission(Permission permission) async {
+    try {
+      return (await permission.request()).isGranted;
+    } catch (e) {
+      // For example, another permission request is already on screen.
+      debugPrint('Chat360LiveChatSDK: permission request failed: $e');
+      return false;
+    }
   }
 
   /// Handles Android's file-chooser callback for `<input type="file">`.
-  ///
-  /// `file_picker` only ever browses existing files, so a plain page
-  /// `<input type="file">` uses it as-is. But `params.isCaptureEnabled`
-  /// (set when the page adds a `capture` attribute, e.g. for a "take a
-  /// photo" attachment button) means the page wants the camera directly —
-  /// `file_picker` has no camera UI, so that case goes through
-  /// `image_picker`'s `ImageSource.camera` instead.
-  Future<List<String>> _onShowFileSelector(FileSelectorParams params) async {
-    if (params.isCaptureEnabled) {
-      final wantsVideo =
-          params.acceptTypes.any((type) => type.startsWith('video/'));
-      final picker = ImagePicker();
-      final file = wantsVideo
-          ? await picker.pickVideo(source: ImageSource.camera)
-          : await picker.pickImage(source: ImageSource.camera);
-      return file == null ? const [] : [Uri.file(file.path).toString()];
-    }
-
-    final result = await FilePicker.platform.pickFiles(
+  Future<List<String>> _onShowFileSelector(FileSelectorParams params) {
+    return Chat360FileSelector(
+      requestCamera: () => _requestPermission(Permission.camera),
+      capture: ({required video}) async {
+        final picker = ImagePicker();
+        final file = video
+            ? await picker.pickVideo(source: ImageSource.camera)
+            : await picker.pickImage(source: ImageSource.camera);
+        return file?.path;
+      },
+      pick: ({required type, extensions, required allowMultiple}) async {
+        final result = await FilePicker.platform.pickFiles(
+          type: type,
+          allowedExtensions: extensions,
+          allowMultiple: allowMultiple,
+          withReadStream: false,
+        );
+        return result?.paths.whereType<String>().toList() ?? const [];
+      },
+      onError: _reportActionError,
+    ).select(
+      captureEnabled: params.isCaptureEnabled,
+      acceptTypes: params.acceptTypes,
       allowMultiple: params.mode == FileSelectorMode.openMultiple,
-      type: FileType.any,
-      withReadStream: false,
     );
-    final paths = result?.paths.whereType<String>() ?? const <String>[];
-    return paths.map((path) => Uri.file(path).toString()).toList();
   }
 
   String _jsString(String value) {

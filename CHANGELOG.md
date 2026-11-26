@@ -1,3 +1,18 @@
+## 0.0.7
+
+- **Changed**: camera and microphone access is requested only when the chat
+  page uses it, not when chat opens, and only while a page from the auth base
+  URL is showing. On iOS the WebView shows the system prompt itself, so no
+  `permission_handler` Podfile settings are needed.
+- **Added**: `Chat360LiveChatSDK.onActionError`, with a `SnackBar` by default,
+  for denied permissions (Android), failed attachments, and links or documents
+  that can't be opened.
+- **Fixed**: errors from the Android camera or file picker, and from opening a
+  link, are caught.
+- **Fixed**: the Android file picker follows the file types the page accepts,
+  and shows all files when it can't express them.
+- **Docs**: added `NSPhotoLibraryUsageDescription` to the iOS setup.
+
 ## 0.0.6
 
 - **Added**: `Chat360LiveAuth.getCredentials` — when Chat360 rejects the
