@@ -1,3 +1,28 @@
+## 0.0.6
+
+- **Added**: `Chat360LiveAuth.getCredentials` — when Chat360 rejects the
+  refresh token of an OEM SSO session, the SDK gets fresh credentials from
+  the host and signs in again through
+  `POST /api/campaign-oem/sso/login` before reporting the session expired.
+  Also added `sessionRevision` and `webStorageOwner`, which
+  `Chat360LiveChatSDK` uses to follow session changes.
+- **Fixed**: an SSO sign-in no longer keeps the previous agent's cached
+  email, which could register push under that agent.
+- **Fixed**: `withJWT` on a cold start now logs out and unregisters a saved
+  session instead of silently overwriting it.
+- **Fixed**: a sign-in or refresh still in flight can no longer restore a
+  session after `logout()`.
+- **Fixed**: `Chat360LiveChatSDK` reloads when the session changes, and
+  shows the chat again after signing back in. It previously kept the first
+  session's page.
+- **Changed**: the console's web storage is cleared when a session ends or
+  another agent's session loads. The first load after upgrading also clears
+  it once.
+- **Changed**: a different `loginId` passed to `withJWT` ends the current
+  session even if the new exchange fails. `logout()` now clears the local
+  session before its network calls finish.
+- **Changed**: a failed push unregistration is saved and retried.
+
 ## 0.0.5
 
 - **Fixed**: a session's `baseUrl` is now persisted and restored with it

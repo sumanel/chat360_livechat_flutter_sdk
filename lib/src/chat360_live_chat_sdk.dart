@@ -1,7 +1,7 @@
 import 'dart:async';
 
 import 'package:file_picker/file_picker.dart';
-import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/foundation.dart' show debugPrint, kDebugMode;
 import 'package:image_picker/image_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -216,6 +216,7 @@ class Chat360LiveChatSDK extends StatefulWidget {
 
 class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   static const _liveChatsPath = '/live-chats';
+  static const _blankPage = 'about:blank';
   static final _chatDetailPath = RegExp(r'^/chats/[0-9a-fA-F-]{36}$');
 
   // Trims a trailing slash so a baseUrl given to auth as e.g.
@@ -230,6 +231,14 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   // Chat360LiveAuth can notify more than once before that happens (e.g. once
   // when restore() finishes, again if login() is somehow also in flight).
   bool _hasStartedLoadingWebView = false;
+  // The Chat360LiveAuth.sessionRevision the WebView was loaded for; null
+  // while it holds no session. A different value means another token pair
+  // (possibly another agent's) took over and the console must be reloaded.
+  int? _loadedRevision;
+  // True while this widget is itself refreshing, which can replace the
+  // session — the load already in progress picks that up, so
+  // _onAuthChanged must not start a second one.
+  bool _isPreparing = false;
   bool _hasInjectedSession = false;
   bool _hasVerifiedLiveChatsRoute = false;
   // Caps the refresh-and-retry in _onPageFinished at one attempt. Without
@@ -331,9 +340,19 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   /// actually done — showing signed-out before that would flash it for an
   /// agent who's still logged in.
   void _onAuthChanged() {
-    if (!_hasStartedLoadingWebView && widget.auth.tokens != null) {
-      unawaited(_beginLoadingWebView());
-      return;
+    if (widget.auth.tokens != null) {
+      if (!_hasStartedLoadingWebView ||
+          (!_isPreparing && widget.auth.sessionRevision != _loadedRevision)) {
+        unawaited(_beginLoadingWebView());
+        return;
+      }
+    } else if (_hasStartedLoadingWebView) {
+      unawaited(_clearWebSession());
+      // Mid-way through replacing one session with another.
+      if (widget.auth.isRestoring) {
+        setState(() => _status = _Status.loading);
+        return;
+      }
     }
     if (widget.auth.tokens == null &&
         !widget.auth.isRestoring &&
@@ -371,8 +390,18 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   /// is still resolving — can't start a second, overlapping load.
   Future<void> _beginLoadingWebView() async {
     _hasStartedLoadingWebView = true;
+    _hasInjectedSession = false;
+    _hasVerifiedLiveChatsRoute = false;
+    _hasAttemptedRefresh = false;
+    _isOnChatDetail = false;
+    if (_status != _Status.loading) {
+      setState(() => _status = _Status.loading);
+    }
+    _isPreparing = true;
     final tokens = await widget.auth.ensureFreshTokens();
+    _isPreparing = false;
     if (!mounted) return;
+    _loadedRevision = widget.auth.sessionRevision;
     if (tokens == null) {
       // Had a session, tried to make it work, couldn't — same "only a real
       // login recovers this" situation _onPageFinished's own refresh
@@ -382,6 +411,25 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
       return;
     }
     await _controller.loadRequest(Uri.parse('$_baseUrl$_liveChatsPath'));
+  }
+
+  /// Removes the ended session's data from the console's web storage and
+  /// unloads the page, so it can't keep running as that agent. Only touches
+  /// the console's own origin, never other WebViews' data in the host app.
+  Future<void> _clearWebSession() async {
+    _hasStartedLoadingWebView = false;
+    _loadedRevision = null;
+    try {
+      await _controller.runJavaScript(
+        'localStorage.clear(); sessionStorage.clear();',
+      );
+    } catch (e) {
+      debugPrint('Chat360LiveChatSDK: could not clear web storage: $e');
+    }
+    // A new session may have started loading while the script ran.
+    if (mounted && !_hasStartedLoadingWebView) {
+      await _controller.loadRequest(Uri.parse(_blankPage));
+    }
   }
 
   Future<NavigationDecision> _onNavigationRequest(
@@ -394,6 +442,8 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
       // for something that was never a real navigation.
       return NavigationDecision.navigate;
     }
+
+    if (request.url == _blankPage) return NavigationDecision.navigate;
 
     final rewritten = _rewriteLiveChatUrl(request.url);
     if (rewritten != null) {
@@ -440,6 +490,7 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   }
 
   Future<void> _onPageFinished(String url) async {
+    if (url == _blankPage || widget.auth.tokens == null) return;
     if (!_hasInjectedSession) {
       _hasInjectedSession = true;
       await _injectSession();
@@ -470,7 +521,10 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
         // stale, so injecting it didn't produce a working session. Try a
         // silent refresh before giving up: this is the normal path for an
         // expired access token and needs no host involvement.
+        _isPreparing = true;
         final refreshed = await widget.auth.refresh();
+        _isPreparing = false;
+        _loadedRevision = widget.auth.sessionRevision;
         if (refreshed == null) {
           if (mounted) setState(() => _status = _Status.authError);
           return;
@@ -499,7 +553,15 @@ class _Chat360LiveChatSDKState extends State<Chat360LiveChatSDK> {
   Future<void> _injectSession() {
     final tokens = widget.auth.tokens;
     if (tokens == null) return Future.value();
+    // The owner check drops anything a different agent left in storage,
+    // including after a logout() made while this widget wasn't showing.
+    final owner = _jsString(widget.auth.webStorageOwner ?? '');
     return _controller.runJavaScript('''
+      if (localStorage.getItem('chat360-sdk-owner') !== $owner) {
+        localStorage.clear();
+        sessionStorage.clear();
+        localStorage.setItem('chat360-sdk-owner', $owner);
+      }
       localStorage.setItem('token', ${_jsString(tokens.accessToken)});
       localStorage.setItem('refresh-token', ${_jsString(tokens.refreshToken)});
     ''');

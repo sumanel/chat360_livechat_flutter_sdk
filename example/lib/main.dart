@@ -219,16 +219,22 @@ class _LoginPageState extends State<LoginPage> {
 
     final fcmToken = await _fetchFcmToken();
     _auth.updateBaseUrl(_resolvedBaseUrl());
+    final credentials = Chat360JWTTokens(
+      clientId: 'heromotocorp',
+      jwtToken: jwtToken,
+      extra: {
+        'loginId': loginId,
+        'dealerCode': dealerCode,
+        'divisionName': divisionName,
+      },
+    );
+    // Lets the SDK sign in again by itself if Chat360 rejects the refresh
+    // token. This demo can only replay the pasted JWT; a real host must
+    // fetch a fresh one from its own session here, and throw if the user
+    // is no longer signed in.
+    _auth.getCredentials = () async => credentials;
     final auth = Chat360LiveAuth.withJWT(
-      Chat360JWTTokens(
-        clientId: 'heromotocorp',
-        jwtToken: jwtToken,
-        extra: {
-          'loginId': loginId,
-          'dealerCode': dealerCode,
-          'divisionName': divisionName,
-        },
-      ),
+      credentials,
       fcmToken: fcmToken,
       appId: Platform.isAndroid
           ? 'io.chat360.livechat_webview_demo'

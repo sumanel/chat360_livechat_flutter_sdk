@@ -51,6 +51,43 @@ class Chat360JWTTokens {
   final Map<String, String> extra;
 }
 
+/// Supplies fresh OEM SSO credentials on demand — see
+/// [Chat360LiveAuth.getCredentials].
+typedef Chat360CredentialsProvider = Future<Chat360JWTTokens> Function();
+
+/// A session saved by an earlier app run that an in-flight OEM SSO exchange
+/// is about to replace. Deliberately not exposed through
+/// [Chat360LiveAuth.tokens]; kept only so it can be ended properly.
+class _SessionSnapshot {
+  const _SessionSnapshot({
+    required this.tokens,
+    required this.baseUrl,
+    required this.email,
+    required this.fcmToken,
+    required this.ssoIdentity,
+  });
+
+  final Chat360Tokens tokens;
+  final String baseUrl;
+  final String? email;
+  final String? fcmToken;
+  final String? ssoIdentity;
+}
+
+/// The outcome of one `campaign-oem/sso/login` call. [rejected] separates a
+/// definite "no" from a failure worth retrying (network, 5xx).
+class _SsoResult {
+  const _SsoResult.success(Chat360Tokens this.tokens)
+      : error = null,
+        rejected = false;
+  const _SsoResult.failure(String this.error, {required this.rejected})
+      : tokens = null;
+
+  final Chat360Tokens? tokens;
+  final String? error;
+  final bool rejected;
+}
+
 /// Minimal persistence seam [Chat360LiveAuth] stores its session through —
 /// implemented by [FlutterSecureStorage] for real use (the default), or a
 /// fake for tests. Exists because [FlutterSecureStorage] itself is a
@@ -129,7 +166,11 @@ class Chat360LiveAuth extends ChangeNotifier {
   })  : _baseUrl = _normalizeBaseUrl(baseUrl),
         _http = httpClient,
         _storage = storage {
-    _restore();
+    _restored = _restore().catchError((Object e) {
+      debugPrint('Chat360LiveAuth: restore failed: ${e.runtimeType}');
+      _isRestoringFromStorage = false;
+      notifyListeners();
+    });
   }
 
   static Chat360LiveAuth? _instance;
@@ -190,9 +231,8 @@ class Chat360LiveAuth extends ChangeNotifier {
     final previousFcm = instance._registeredFcmToken;
     final previousBaseUrl = instance._sessionBaseUrl ?? instance._baseUrl;
 
-    instance._tokens = tokens;
-    instance._registeredFcmToken = null;
-    instance._sessionBaseUrl = instance._baseUrl;
+    instance._cancelSsoExchange();
+    instance._replaceSession(tokens);
     instance._isRestoringFromStorage = false;
     unawaited(instance._persist());
     instance.notifyListeners();
@@ -244,7 +284,6 @@ class Chat360LiveAuth extends ChangeNotifier {
       httpClient: httpClient,
       storage: storage,
     );
-    instance._isExchangingSso = true;
     unawaited(instance._loginWithOemSso(jwt, fcmToken: fcmToken));
     return instance;
   }
@@ -313,12 +352,13 @@ class Chat360LiveAuth extends ChangeNotifier {
     // restored under an older SDK version that never persisted this.
     final previousBaseUrl = _sessionBaseUrl ?? _baseUrl;
     _baseUrl = normalized;
+    // Also makes any exchange or refresh in flight against the old origin
+    // stale.
+    _cancelSsoExchange();
+    _epoch++;
     if (previousTokens == null) return;
 
-    _tokens = null;
-    _email = null;
-    _registeredFcmToken = null;
-    _sessionBaseUrl = null;
+    _replaceSession(null);
     unawaited(_persist());
     notifyListeners();
     unawaited(
@@ -363,6 +403,36 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// string to the user as-is.
   String? lastSsoError;
 
+  /// Set this so an OEM SSO session can recover on its own. When the server
+  /// rejects the refresh token of a session created by [withJWT] (including
+  /// one restored from an earlier run), this is asked for fresh credentials
+  /// and they are exchanged once via `POST /api/campaign-oem/sso/login`.
+  /// [onSessionExpired] then fires only if that fails too: this throws or
+  /// takes over 30 seconds, or the API rejects the exchange. A network or
+  /// server (5xx) failure keeps the session so a later [refresh] can retry.
+  ///
+  /// Sessions from [login] or [withTokens] never use this. Not persisted —
+  /// set it on every app run.
+  Chat360CredentialsProvider? getCredentials;
+
+  /// Increases every time a different token pair takes over — a sign-in,
+  /// a restore, or an SSO re-exchange — but not on a plain access-token
+  /// refresh. [Chat360LiveChatSDK] reloads its WebView when it changes.
+  int get sessionRevision => _sessionRevision;
+
+  /// Identifies whose data the console's web storage holds: stable for one
+  /// OEM agent across SSO exchanges, different for another agent. Null when
+  /// signed out. Used by [Chat360LiveChatSDK] to clear storage left behind
+  /// by someone else.
+  String? get webStorageOwner {
+    if (_tokens == null) return null;
+    final sso = _ssoIdentity;
+    if (sso != null && !sso.endsWith('/')) return 'sso:$sso';
+    final email = _email;
+    if (email != null) return 'email:$email';
+    return 'session:$_sessionId';
+  }
+
   /// Called when a session ends because the server rejected its refresh
   /// token — i.e. the agent was signed out on Chat360's side (revoked,
   /// deactivated, forced out by an admin, or any other reason the backend
@@ -389,6 +459,74 @@ class Chat360LiveAuth extends ChangeNotifier {
 
   String? _email;
   String? _registeredFcmToken;
+
+  /// `clientId/loginId` when the current session came from OEM SSO.
+  String? _ssoIdentity;
+  String? _sessionId;
+  int _sessionRevision = 0;
+
+  /// Bumped whenever the session is replaced, cleared or moved to another
+  /// origin. An async call that started under an older value is stale, and
+  /// must not write its result over whatever happened since.
+  int _epoch = 0;
+  int _ssoAttempt = 0;
+  _SessionSnapshot? _savedDuringExchange;
+  Future<Chat360Tokens?>? _refreshing;
+  int? _refreshingEpoch;
+  Future<void> _pushQueue = Future<void>.value();
+  late final Future<void> _restored;
+
+  static const _ssoIdentityKey = 'chat360_sso_identity';
+  static const _sessionIdKey = 'chat360_session_id';
+  static const _pendingFcmRemovalKey = 'chat360_pending_fcm_removal';
+
+  /// The current session as a unit — or, while an SSO exchange is replacing
+  /// one from an earlier run, that saved one.
+  _SessionSnapshot? get _heldSession {
+    final current = _tokens;
+    if (current == null) return _savedDuringExchange;
+    return _SessionSnapshot(
+      tokens: current,
+      baseUrl: _sessionBaseUrl ?? _baseUrl,
+      email: _email,
+      fcmToken: _registeredFcmToken,
+      ssoIdentity: _ssoIdentity,
+    );
+  }
+
+  /// Makes [tokens] (or, when null, no session) the current state. Every
+  /// identity field is reset so nothing carries over between agents.
+  void _replaceSession(
+    Chat360Tokens? tokens, {
+    String? email,
+    String? ssoIdentity,
+    String? baseUrl,
+  }) {
+    _epoch++;
+    _savedDuringExchange = null;
+    _tokens = tokens;
+    _email = email;
+    _ssoIdentity = ssoIdentity;
+    _registeredFcmToken = null;
+    _sessionBaseUrl = tokens == null ? null : baseUrl ?? _baseUrl;
+    _sessionId =
+        tokens == null ? null : '${DateTime.now().microsecondsSinceEpoch}';
+    if (tokens != null) _sessionRevision++;
+  }
+
+  /// Abandons any [withJWT] exchange in flight, because the host has since
+  /// asked for something else.
+  void _cancelSsoExchange() {
+    _ssoAttempt++;
+    _isExchangingSso = false;
+  }
+
+  Future<void> _endSnapshot(_SessionSnapshot session) => _endSession(
+        session.tokens,
+        baseUrl: session.baseUrl,
+        email: session.email,
+        fcmToken: session.fcmToken,
+      );
 
   @override
   void dispose() {
@@ -422,20 +560,32 @@ class Chat360LiveAuth extends ChangeNotifier {
     final email = await _storage.read(key: _emailKey);
     final fcmToken = await _storage.read(key: _fcmKey);
     final sessionBaseUrl = await _storage.read(key: _sessionBaseUrlKey);
+    final ssoIdentity = await _storage.read(key: _ssoIdentityKey);
+    final sessionId = await _storage.read(key: _sessionIdKey);
     // Since this class is a singleton, the disk reads above can finish
     // after Chat360LiveAuth.withTokens (or an unusually fast login()) has
     // already given this instance a session — don't clobber it with
-    // whatever was (or wasn't) on disk from before. Chat360LiveAuth.withJWT
-    // sets _tokens only once its network exchange resolves, which is far
-    // slower than this local read — _isExchangingSso covers that gap so a
-    // *previous* on-disk session (a different agent's, say) can't get
-    // loaded and briefly used while the new SSO exchange is still in
-    // flight.
-    if (_tokens == null && !_isExchangingSso) {
-      _email = email;
-      _registeredFcmToken = fcmToken;
-      if (access != null && refresh != null) {
-        _tokens = Chat360Tokens(accessToken: access, refreshToken: refresh);
+    // whatever was (or wasn't) on disk from before. While a
+    // Chat360LiveAuth.withJWT exchange is in flight, the saved session
+    // (a different agent's, say) is held aside instead: never exposed or
+    // used, but still known so the exchange can end it.
+    if (_tokens == null && access != null && refresh != null) {
+      final saved = Chat360Tokens(accessToken: access, refreshToken: refresh);
+      if (_isExchangingSso) {
+        _savedDuringExchange = _SessionSnapshot(
+          tokens: saved,
+          baseUrl: sessionBaseUrl ?? _baseUrl,
+          email: email,
+          fcmToken: fcmToken,
+          ssoIdentity: ssoIdentity,
+        );
+      } else {
+        _email = email;
+        _registeredFcmToken = fcmToken;
+        _ssoIdentity = ssoIdentity;
+        _sessionId = sessionId;
+        _tokens = saved;
+        _sessionRevision++;
         _sessionBaseUrl = sessionBaseUrl ?? _baseUrl;
         // A restored session's own baseUrl wins over whatever this run
         // happened to construct/restore with — unless a host has already
@@ -463,6 +613,8 @@ class Chat360LiveAuth extends ChangeNotifier {
         _storage.delete(key: _emailKey),
         _storage.delete(key: _fcmKey),
         _storage.delete(key: _sessionBaseUrlKey),
+        _storage.delete(key: _ssoIdentityKey),
+        _storage.delete(key: _sessionIdKey),
       ]);
       return;
     }
@@ -478,6 +630,14 @@ class Chat360LiveAuth extends ChangeNotifier {
         key: _sessionBaseUrlKey,
         value: _sessionBaseUrl ?? _baseUrl,
       ),
+      if (_ssoIdentity != null)
+        _storage.write(key: _ssoIdentityKey, value: _ssoIdentity!)
+      else
+        _storage.delete(key: _ssoIdentityKey),
+      if (_sessionId != null)
+        _storage.write(key: _sessionIdKey, value: _sessionId!)
+      else
+        _storage.delete(key: _sessionIdKey),
     ]);
   }
 
@@ -519,10 +679,8 @@ class Chat360LiveAuth extends ChangeNotifier {
     final previousFcm = _registeredFcmToken;
     final previousBaseUrl = _sessionBaseUrl ?? _baseUrl;
 
-    _tokens = tokens;
-    _email = (body['user_email'] as String?) ?? email;
-    _registeredFcmToken = null;
-    _sessionBaseUrl = _baseUrl;
+    _cancelSsoExchange();
+    _replaceSession(tokens, email: (body['user_email'] as String?) ?? email);
     await _persist();
     notifyListeners();
 
@@ -546,11 +704,81 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// throws — this stores it in [lastSsoError] instead: there's no caller
   /// left to catch an exception by the time this runs, since [withJWT]
   /// already returned the singleton before this started.
+  ///
+  /// A saved or current session for a *different* OEM agent is ended before
+  /// the exchange, whether or not the exchange then succeeds. Otherwise the
+  /// old session is ended only once the new one exists.
   Future<void> _loginWithOemSso(Chat360JWTTokens jwt,
       {String? fcmToken}) async {
+    // Everything up to the first await runs inside withJWT itself.
+    final attempt = ++_ssoAttempt;
+    _isExchangingSso = true;
+    lastSsoError = null;
+    final baseUrl = _baseUrl;
+    // Only something the host does (another sign-in, logout, a new origin)
+    // supersedes this exchange. The old session dying meanwhile must not.
+    bool stale() => attempt != _ssoAttempt;
+    try {
+      await _restored;
+      if (stale()) return;
+
+      final identity = _identityOf(jwt);
+      final held = _heldSession;
+      if (held?.ssoIdentity != null && held!.ssoIdentity != identity) {
+        _replaceSession(null);
+        await _persist();
+        notifyListeners();
+        await _endSnapshot(held);
+        if (stale()) return;
+      }
+
+      final result = await _requestSsoTokens(jwt, baseUrl);
+      final tokens = result.tokens;
+      if (stale()) {
+        // Signed out or replaced while waiting: don't adopt, and don't
+        // leave the unused refresh token live.
+        if (tokens != null) await _revoke(tokens, baseUrl);
+        return;
+      }
+      if (tokens == null) {
+        lastSsoError = result.error;
+        return;
+      }
+
+      final previous = _heldSession;
+      _replaceSession(tokens, ssoIdentity: identity, baseUrl: baseUrl);
+      await _persist();
+
+      if (previous != null) await _endSnapshot(previous);
+      if (stale()) return;
+      if (fcmToken != null) {
+        await _registerFcm(fcmToken);
+      } else {
+        await _retryPendingFcmRemovals();
+      }
+    } catch (e) {
+      debugPrint('Chat360LiveAuth: OEM SSO failed: ${e.runtimeType}');
+      lastSsoError = 'Token validation failed.';
+    } finally {
+      if (attempt == _ssoAttempt) {
+        _isExchangingSso = false;
+        notifyListeners();
+      }
+    }
+  }
+
+  static String _identityOf(Chat360JWTTokens jwt) =>
+      '${jwt.clientId}/${jwt.extra['loginId'] ?? ''}';
+
+  /// The one place `campaign-oem/sso/login` is called. Never throws.
+  Future<_SsoResult> _requestSsoTokens(
+    Chat360JWTTokens jwt,
+    String baseUrl,
+  ) async {
+    var status = 0;
     try {
       final response = await _http.post(
-        _api('campaign-oem/sso/login'),
+        _api('campaign-oem/sso/login', baseUrl: baseUrl),
         headers: const {'Content-Type': 'application/json'},
         body: jsonEncode({
           'clientId': jwt.clientId,
@@ -558,43 +786,23 @@ class Chat360LiveAuth extends ChangeNotifier {
           'extra': jwt.extra,
         }),
       );
+      status = response.statusCode;
       final body = jsonDecode(response.body) as Map<String, dynamic>;
-      if (response.statusCode != 200) {
-        lastSsoError = (body['message'] as String?) ??
-            'OEM SSO login failed (${response.statusCode}).';
-        return;
-      }
-      lastSsoError = null;
-
-      final previousTokens = _tokens;
-      final previousEmail = _email;
-      final previousFcm = _registeredFcmToken;
-      final previousBaseUrl = _sessionBaseUrl ?? _baseUrl;
-
-      _tokens = Chat360Tokens(
-        accessToken: body['accessToken'] as String,
-        refreshToken: body['refreshToken'] as String,
-      );
-      _registeredFcmToken = null;
-      _sessionBaseUrl = _baseUrl;
-      await _persist();
-
-      if (previousTokens != null) {
-        await _endSession(
-          previousTokens,
-          baseUrl: previousBaseUrl,
-          email: previousEmail,
-          fcmToken: previousFcm,
+      if (status != 200) {
+        return _SsoResult.failure(
+          (body['message'] as String?) ?? 'OEM SSO login failed ($status).',
+          rejected: status >= 400 && status < 500,
         );
       }
-      if (fcmToken != null) {
-        await _registerFcm(fcmToken);
-      }
+      return _SsoResult.success(Chat360Tokens(
+        accessToken: body['accessToken'] as String,
+        refreshToken: body['refreshToken'] as String,
+      ));
     } catch (_) {
-      lastSsoError = 'Token validation failed.';
-    } finally {
-      _isExchangingSso = false;
-      notifyListeners();
+      return _SsoResult.failure(
+        'Token validation failed.',
+        rejected: status >= 400 && status < 500,
+      );
     }
   }
 
@@ -602,24 +810,26 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// registered at [login] — even in a previous run of the app, since that
   /// registration is persisted — and clears the local session regardless
   /// of whether those network calls succeed: a host calling this expects
-  /// the session gone either way.
+  /// the session gone either way. Also cancels a sign-in or refresh that is
+  /// still in flight, so its late result can't sign the agent back in.
   Future<void> logout() async {
-    final current = _tokens;
-    if (current == null) return;
+    _epoch++;
+    _ssoAttempt++;
+    await _restored;
+    final wasExchanging = _isExchangingSso;
+    _isExchangingSso = false;
+    final held = _heldSession;
+    if (held == null) {
+      if (wasExchanging) notifyListeners();
+      return;
+    }
 
-    await _endSession(
-      current,
-      baseUrl: _sessionBaseUrl ?? _baseUrl,
-      email: _email,
-      fcmToken: _registeredFcmToken,
-    );
-
-    _tokens = null;
-    _email = null;
-    _registeredFcmToken = null;
-    _sessionBaseUrl = null;
+    // Cleared before the network calls: a refresh racing them must not see
+    // a dying session and report it as a remote sign-out.
+    _replaceSession(null);
     await _persist();
     notifyListeners();
+    await _endSnapshot(held);
   }
 
   /// Best-effort server-side teardown of a session that's about to stop
@@ -640,13 +850,20 @@ class Chat360LiveAuth extends ChangeNotifier {
     required String? fcmToken,
   }) async {
     if (fcmToken != null && email != null) {
-      await _unregisterFcmFor(
+      final removed = await _unregisterFcmFor(
         baseUrl: baseUrl,
         email: email,
         accessToken: tokens.accessToken,
         fcmToken: fcmToken,
       );
+      if (!removed) {
+        await _queueFcmRemoval(baseUrl, email, fcmToken);
+      }
     }
+    await _revoke(tokens, baseUrl);
+  }
+
+  Future<void> _revoke(Chat360Tokens tokens, String baseUrl) async {
     try {
       await _http.get(
         _api('auth/logout', baseUrl: baseUrl).replace(
@@ -668,9 +885,25 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// genuinely over and only a real [login] can recover it; when that
   /// happens, [tokens] is cleared and listeners are notified, same as
   /// [logout].
-  Future<Chat360Tokens?> refresh() async {
+  ///
+  /// An OEM SSO session with [getCredentials] set first tries one new SSO
+  /// exchange before giving up. Concurrent calls share one attempt.
+  Future<Chat360Tokens?> refresh() {
+    final running = _refreshing;
+    if (running != null && _refreshingEpoch == _epoch) return running;
+    _refreshingEpoch = _epoch;
+    late final Future<Chat360Tokens?> started;
+    started = _refreshOnce().whenComplete(() {
+      if (identical(_refreshing, started)) _refreshing = null;
+    });
+    return _refreshing = started;
+  }
+
+  Future<Chat360Tokens?> _refreshOnce() async {
     final current = _tokens;
     if (current == null) return null;
+    final epoch = _epoch;
+    final baseUrl = _sessionBaseUrl ?? _baseUrl;
 
     final http.Response response;
     try {
@@ -688,12 +921,17 @@ class Chat360LiveAuth extends ChangeNotifier {
       debugPrint('Chat360LiveAuth: refresh failed (network): $e');
       return null;
     }
+    // Signed out or replaced while waiting — this answer is about a session
+    // that's no longer current.
+    if (epoch != _epoch) return _tokens;
     if (response.statusCode != 200) {
-      _tokens = null;
-      _sessionBaseUrl = null;
-      await _persist();
-      notifyListeners();
-      onSessionExpired?.call();
+      // A new sign-in is already on its way and will replace this session.
+      if (_isExchangingSso) return null;
+      final provider = getCredentials;
+      if (_ssoIdentity != null && provider != null) {
+        return _reexchange(provider, epoch, baseUrl);
+      }
+      await _expireSession();
       return null;
     }
 
@@ -706,6 +944,163 @@ class Chat360LiveAuth extends ChangeNotifier {
     await _persist();
     notifyListeners();
     return refreshed;
+  }
+
+  Future<Chat360Tokens?> _reexchange(
+    Chat360CredentialsProvider provider,
+    int epoch,
+    String baseUrl,
+  ) async {
+    final Chat360JWTTokens jwt;
+    try {
+      jwt = await provider().timeout(const Duration(seconds: 30));
+    } catch (e) {
+      debugPrint('Chat360LiveAuth: getCredentials failed: ${e.runtimeType}');
+      if (epoch != _epoch) return _tokens;
+      lastSsoError = 'Token validation failed.';
+      await _expireSession();
+      return null;
+    }
+    if (epoch != _epoch) return _tokens;
+
+    final result = await _requestSsoTokens(jwt, baseUrl);
+    final tokens = result.tokens;
+    if (epoch != _epoch) {
+      if (tokens != null) await _revoke(tokens, baseUrl);
+      return _tokens;
+    }
+    if (tokens == null) {
+      lastSsoError = result.error;
+      if (result.rejected) await _expireSession();
+      return null;
+    }
+
+    final previous = _heldSession!;
+    final identity = _identityOf(jwt);
+    final sameAgent = identity == previous.ssoIdentity;
+    lastSsoError = null;
+    _replaceSession(
+      tokens,
+      email: sameAgent ? previous.email : null,
+      ssoIdentity: identity,
+      baseUrl: baseUrl,
+    );
+    // The same agent's push registration is still on the server, so keep
+    // tracking it even if renewing it below fails.
+    if (sameAgent) _registeredFcmToken = previous.fcmToken;
+    await _persist();
+    notifyListeners();
+
+    if (!sameAgent) await _endSnapshot(previous);
+    final fcmToken = sameAgent ? previous.fcmToken : null;
+    if (fcmToken != null) {
+      await _registerFcm(fcmToken);
+    } else {
+      await _retryPendingFcmRemovals();
+    }
+    return _tokens;
+  }
+
+  /// Ends a session the server no longer accepts. Its push registration
+  /// outlives it unless removed, so the details are saved for retry before
+  /// the local session is cleared.
+  Future<void> _expireSession() async {
+    final held = _heldSession;
+    if (held == null) return;
+    _replaceSession(null);
+    final email = held.email;
+    final fcmToken = held.fcmToken;
+    if (email != null && fcmToken != null) {
+      await _queueFcmRemoval(held.baseUrl, email, fcmToken);
+    }
+    await _persist();
+    notifyListeners();
+    onSessionExpired?.call();
+    // Often refused, as the access token is usually dead by now.
+    await _retryPendingFcmRemovals(
+      accessToken: held.tokens.accessToken,
+      baseUrl: held.baseUrl,
+    );
+  }
+
+  /// Runs push (de)registration one step at a time, so a delayed removal
+  /// can't land after, and delete, a newer registration.
+  Future<void> _serializePush(Future<void> Function() step) {
+    return _pushQueue = _pushQueue.then((_) => step()).catchError((Object e) {
+      debugPrint('Chat360LiveAuth: push bookkeeping failed: ${e.runtimeType}');
+    });
+  }
+
+  Future<List<Map<String, dynamic>>> _readPendingFcmRemovals() async {
+    final raw = await _storage.read(key: _pendingFcmRemovalKey);
+    if (raw == null) return [];
+    try {
+      return (jsonDecode(raw) as List).cast<Map<String, dynamic>>().toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<void> _writePendingFcmRemovals(List<Map<String, dynamic>> pending) =>
+      pending.isEmpty
+          ? _storage.delete(key: _pendingFcmRemovalKey)
+          : _storage.write(
+              key: _pendingFcmRemovalKey, value: jsonEncode(pending));
+
+  static bool _isRemovalFor(
+    Map<String, dynamic> entry,
+    String baseUrl,
+    String email,
+    String fcmToken,
+  ) =>
+      entry['baseUrl'] == baseUrl &&
+      entry['email'] == email &&
+      entry['fcmToken'] == fcmToken;
+
+  Future<void> _queueFcmRemoval(
+    String baseUrl,
+    String email,
+    String fcmToken,
+  ) =>
+      _serializePush(() async {
+        final pending = await _readPendingFcmRemovals()
+          ..removeWhere((e) => _isRemovalFor(e, baseUrl, email, fcmToken))
+          ..add({'baseUrl': baseUrl, 'email': email, 'fcmToken': fcmToken});
+        // Bounded: removals the server keeps refusing mustn't pile up.
+        await _writePendingFcmRemovals(
+            pending.length > 5 ? pending.sublist(pending.length - 5) : pending);
+      });
+
+  /// Retries queued removals for one origin, by default with the current
+  /// session. An entry is dropped only once the server answers 200.
+  Future<void> _retryPendingFcmRemovals({
+    String? accessToken,
+    String? baseUrl,
+  }) =>
+      _serializePush(() => _sendPendingFcmRemovals(
+            accessToken ?? _tokens?.accessToken,
+            baseUrl ?? _sessionBaseUrl,
+          ));
+
+  Future<void> _sendPendingFcmRemovals(
+    String? accessToken,
+    String? baseUrl,
+  ) async {
+    if (accessToken == null || baseUrl == null) return;
+    final pending = await _readPendingFcmRemovals();
+    if (pending.isEmpty) return;
+    final remaining = <Map<String, dynamic>>[];
+    for (final entry in pending) {
+      final removed = entry['baseUrl'] == baseUrl &&
+          await _unregisterFcmFor(
+            baseUrl: baseUrl,
+            email: entry['email'] as String,
+            accessToken: accessToken,
+            fcmToken: entry['fcmToken'] as String,
+          );
+      if (!removed) remaining.add(entry);
+    }
+    await _writePendingFcmRemovals(remaining);
   }
 
   /// Decodes a JWT's `exp` claim (seconds since epoch) without verifying
@@ -782,7 +1177,9 @@ class Chat360LiveAuth extends ChangeNotifier {
         _api('auth/user'),
         headers: {'Authorization': 'Bearer $accessToken'},
       );
-      if (response.statusCode == 200 && _email == null) {
+      if (response.statusCode == 200 &&
+          _email == null &&
+          _tokens?.accessToken == accessToken) {
         // Already had to make this call — might as well save _resolveEmail
         // (used for FCM registration) a redundant one later.
         final body = jsonDecode(response.body) as Map<String, dynamic>;
@@ -801,9 +1198,12 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// reported failure, so any error here is logged and swallowed instead.
   Future<void> _registerFcm(String fcmToken) async {
     try {
+      await _retryPendingFcmRemovals();
+      final epoch = _epoch;
       final email = await _resolveEmail();
       final accessToken = _tokens?.accessToken;
-      if (email == null || accessToken == null) return;
+      final baseUrl = _sessionBaseUrl;
+      if (email == null || accessToken == null || epoch != _epoch) return;
 
       final response = await _http.post(
         _api('mobile/notify'),
@@ -819,8 +1219,19 @@ class Chat360LiveAuth extends ChangeNotifier {
         }),
       );
       if (response.statusCode == 200) {
+        if (epoch != _epoch) {
+          // Signed out while registering: undo it.
+          await _queueFcmRemoval(baseUrl!, email, fcmToken);
+          return;
+        }
         _registeredFcmToken = fcmToken;
         await _persist();
+        // This registration supersedes any older removal still queued.
+        await _serializePush(() async {
+          final pending = await _readPendingFcmRemovals()
+            ..removeWhere((e) => _isRemovalFor(e, baseUrl!, email, fcmToken));
+          await _writePendingFcmRemovals(pending);
+        });
       } else {
         // Same best-effort spirit as the catch below — but a non-200 here
         // (e.g. "SDK not found" from a wrong/deleted appId) is a config bug
@@ -839,14 +1250,14 @@ class Chat360LiveAuth extends ChangeNotifier {
   /// Never throws, same best-effort spirit as [_registerFcm] — called from
   /// [logout]/[_endSession], which both need to keep clearing the local
   /// session regardless of whether this network call succeeds.
-  Future<void> _unregisterFcmFor({
+  Future<bool> _unregisterFcmFor({
     required String baseUrl,
     required String email,
     required String accessToken,
     required String fcmToken,
   }) async {
     try {
-      await _http.delete(
+      final response = await _http.delete(
         _api('mobile/notify', baseUrl: baseUrl),
         headers: {
           'Content-Type': 'application/json',
@@ -859,8 +1270,10 @@ class Chat360LiveAuth extends ChangeNotifier {
           if (appId != null) 'app_id': appId,
         }),
       );
+      return response.statusCode == 200;
     } catch (e) {
       debugPrint('Chat360LiveAuth: FCM unregistration failed: $e');
+      return false;
     }
   }
 
@@ -869,11 +1282,12 @@ class Chat360LiveAuth extends ChangeNotifier {
     final current = _tokens;
     if (current == null) return null;
 
+    final epoch = _epoch;
     final response = await _http.get(
       _api('auth/user'),
       headers: {'Authorization': 'Bearer ${current.accessToken}'},
     );
-    if (response.statusCode != 200) return null;
+    if (response.statusCode != 200 || epoch != _epoch) return null;
 
     final body = jsonDecode(response.body) as Map<String, dynamic>;
     _email = body['email'] as String?;
